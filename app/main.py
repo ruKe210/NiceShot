@@ -27,6 +27,23 @@ from app.hotkey import GlobalHotkey, format_key_event
 from app.overlay import CaptureOverlay, grab_virtual_desktop
 from app.window_detect import enum_windows
 
+_SINGLE_MUTEX_NAME = "Local\\NiceShot.Screenshot"
+_ERROR_ALREADY_EXISTS = 183
+_single_mutex = None
+
+
+def acquire_single_instance() -> bool:
+    global _single_mutex
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.CreateMutexW(None, False, _SINGLE_MUTEX_NAME)
+    if not handle:
+        return True
+    if kernel32.GetLastError() == _ERROR_ALREADY_EXISTS:
+        kernel32.CloseHandle(handle)
+        return False
+    _single_mutex = handle
+    return True
+
 
 def enable_dpi_aware() -> None:
     try:
@@ -347,6 +364,9 @@ def main() -> None:
     qt_app = QApplication(sys.argv)
     qt_app.setApplicationName("NiceShot")
     qt_app.setWindowIcon(make_tray_icon())
+    if not acquire_single_instance():
+        QMessageBox.information(None, "NiceShot", "NiceShot 已经在运行。")
+        sys.exit(0)
     if not QSystemTrayIcon.isSystemTrayAvailable():
         QMessageBox.critical(None, "NiceShot", "系统托盘不可用，无法常驻运行。")
         sys.exit(1)
