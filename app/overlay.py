@@ -123,6 +123,8 @@ class CaptureOverlay(QWidget):
         self._active_annot = -1
         self._annot_resize_handle: str | None = None
         self._annot_resize_origin: QRect | None = None
+        self._annot_move_press: QPoint | None = None
+        self._annot_move_origin: QRect | None = None
 
         self.setWindowTitle(OVERLAY_TITLE)
         self.setWindowFlags(
@@ -269,6 +271,10 @@ class CaptureOverlay(QWidget):
                 self._active_annot, self._annot_resize_handle = annot_hit
                 self._annot_resize_origin = QRect(self._annots[self._active_annot].rect)
                 return
+            border = self._hit_annot_border(pos)
+            if border is not None:
+                self._start_annot_move(border, pos)
+                return
             picked = self._hit_annot(pos)
             if picked is not None:
                 self._active_annot = picked
@@ -306,6 +312,9 @@ class CaptureOverlay(QWidget):
             self._place_toolbar()
             self._update_magnifier(pos, (self._selection.width(), self._selection.height()))
             self.update()
+            return
+        if self._finalized and self._annot_move_press is not None and self._annot_move_origin is not None:
+            self._apply_annot_move(pos)
             return
         if self._finalized and self._move_press is not None and self._move_origin is not None:
             self._apply_move(pos)
@@ -375,6 +384,9 @@ class CaptureOverlay(QWidget):
                 return
             if self._move_press is not None:
                 self._end_move(self._event_pos(event))
+                return
+            if self._annot_move_press is not None:
+                self._end_annot_move(self._event_pos(event))
                 return
             if self._annot_resize_handle:
                 if self._annot_resize_origin is not None and 0 <= self._active_annot < len(self._annots):
@@ -504,12 +516,18 @@ class CaptureOverlay(QWidget):
             "w": QPoint(rect.left(), cy),
         }
 
-    def _hit_handle_on(self, rect: QRect, pos: QPoint) -> str | None:
+    def _hit_handle_points(self, rect: QRect, pos: QPoint) -> str | None:
         points = self._handle_points(rect)
         for name in ("nw", "ne", "se", "sw", "n", "s", "e", "w"):
             pt = points[name]
             if abs(pos.x() - pt.x()) <= HANDLE_HIT and abs(pos.y() - pt.y()) <= HANDLE_HIT:
                 return name
+        return None
+
+    def _hit_handle_on(self, rect: QRect, pos: QPoint) -> str | None:
+        hit = self._hit_handle_points(rect, pos)
+        if hit:
+            return hit
         x, y = pos.x(), pos.y()
         inside_x = rect.left() - HANDLE_HIT <= x <= rect.right() + HANDLE_HIT
         inside_y = rect.top() - HANDLE_HIT <= y <= rect.bottom() + HANDLE_HIT
@@ -530,14 +548,94 @@ class CaptureOverlay(QWidget):
 
     def _hit_annot_handle(self, pos: QPoint) -> tuple[int, str] | None:
         if 0 <= self._active_annot < len(self._annots):
-            handle = self._hit_handle_on(self._annots[self._active_annot].rect, pos)
+            handle = self._hit_handle_points(self._annots[self._active_annot].rect, pos)
             if handle:
                 return self._active_annot, handle
         for index in range(len(self._annots) - 1, -1, -1):
-            handle = self._hit_handle_on(self._annots[index].rect, pos)
+            handle = self._hit_handle_points(self._annots[index].rect, pos)
             if handle:
                 return index, handle
         return None
+
+    def _on_rect_border(self, rect: QRect, pos: QPoint, tol: int) -> bool:
+        outer = rect.adjusted(-tol, -tol, tol, tol)
+        inner = rect.adjusted(tol, tol, -tol, -tol)
+        if not outer.contains(pos):
+            return False
+        if inner.width() > 2 and inner.height() > 2 and inner.contains(pos):
+            return False
+        return True
+
+    def _on_ellipse_border(self, rect: QRect, pos: QPoint, tol: int) -> bool:
+        rx = rect.width() / 2
+        ry = rect.height() / 2
+        if rx < 1 or ry < 1:
+            return self._on_rect_border(rect, pos, tol)
+        cx = rect.left() + rx
+        cy = rect.top() + ry
+        dx = (pos.x() - cx) / rx
+        dy = (pos.y() - cy) / ry
+        dist = dx * dx + dy * dy
+        band = max(tol / max(min(rx, ry), 1.0), 0.08)
+        return abs(dist - 1.0) <= band
+
+    def _hit_annot_border(self, pos: QPoint) -> int | None:
+        for index in range(len(self._annots) - 1, -1, -1):
+            item = self._annots[index]
+            tol = max(8, item.width + 4)
+            if item.kind == "ellipse":
+                if self._on_ellipse_border(item.rect, pos, tol):
+                    return index
+            elif self._on_rect_border(item.rect, pos, tol):
+                return index
+        return None
+
+    def _start_annot_move(self, index: int, pos: QPoint) -> None:
+        self._active_annot = index
+        self._annot_move_press = QPoint(pos)
+        self._annot_move_origin = QRect(self._annots[index].rect)
+        self._set_move_cursor(True)
+        self.magnifier.hide()
+        self.update()
+
+    def _apply_annot_move(self, pos: QPoint) -> None:
+        if (
+            self._annot_move_press is None
+            or self._annot_move_origin is None
+            or not (0 <= self._active_annot < len(self._annots))
+        ):
+            return
+        moved = self._moved_rect(self._annot_move_origin, pos - self._annot_move_press)
+        if self._selection:
+            moved = self._clamp_rect(moved, self._selection)
+        self._annots[self._active_annot].rect = moved
+        self._update_magnifier(pos, (moved.width(), moved.height()))
+        self.update()
+
+    def _end_annot_move(self, pos: QPoint) -> None:
+        if (
+            self._annot_move_origin is not None
+            and 0 <= self._active_annot < len(self._annots)
+            and self._annots[self._active_annot].rect != self._annot_move_origin
+        ):
+            self._redo.clear()
+        self._annot_move_press = None
+        self._annot_move_origin = None
+        self._apply_hover_cursor(pos)
+        self._update_magnifier(pos, None)
+        self.update()
+
+    def _clamp_rect(self, rect: QRect, bounds: QRect) -> QRect:
+        w, h = rect.width(), rect.height()
+        x = max(bounds.left(), min(rect.x(), bounds.right() - w + 1))
+        y = max(bounds.top(), min(rect.y(), bounds.bottom() - h + 1))
+        if w > bounds.width():
+            x = bounds.left()
+            w = bounds.width()
+        if h > bounds.height():
+            y = bounds.top()
+            h = bounds.height()
+        return QRect(x, y, w, h).intersected(bounds)
 
     def _hit_annot(self, pos: QPoint) -> int | None:
         for index in range(len(self._annots) - 1, -1, -1):
@@ -574,6 +672,10 @@ class CaptureOverlay(QWidget):
         if annot_hit is not None:
             self._set_move_cursor(False)
             self.setCursor(HANDLE_CURSOR[annot_hit[1]])
+            return
+        if self._hit_annot_border(pos) is not None:
+            self.setCursor(Qt.SizeAllCursor)
+            self._set_move_cursor(True)
             return
         if self._tool:
             self._set_move_cursor(False)

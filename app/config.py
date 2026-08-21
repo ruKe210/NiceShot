@@ -5,8 +5,11 @@ from pathlib import Path
 
 APP_NAME = "NiceShot"
 DEFAULT_HOTKEY = "Ctrl+Shift+A"
+DEFAULT_DISABLE_HOTKEY = "F8"
 DEFAULTS = {
     "hotkey": DEFAULT_HOTKEY,
+    "disable_hotkey": DEFAULT_DISABLE_HOTKEY,
+    "disabled": False,
     "autostart": False,
 }
 

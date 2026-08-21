@@ -34,6 +34,8 @@ VK_MAP = {
     "DOWN": 0x28,
     "PRINTSCREEN": 0x2C,
     "SNAPSHOT": 0x2C,
+    "PAUSE": 0x13,
+    "BREAK": 0x13,
     **{f"F{i}": 0x6F + i for i in range(1, 13)},
 }
 
@@ -66,7 +68,7 @@ def parse_hotkey(text: str) -> tuple[int, int]:
     return mods, vk
 
 
-def format_key_event(event) -> str | None:
+def format_key_event(event, allow_single: bool = False) -> str | None:
     key = event.key()
     if key in (
         Qt.Key_Control,
@@ -90,7 +92,9 @@ def format_key_event(event) -> str | None:
     if not name:
         return None
     parts.append(name.upper() if len(name) == 1 else name)
-    if len(parts) < 2:
+    if not parts:
+        return None
+    if len(parts) < 2 and not allow_single:
         return None
     return "+".join(parts)
 

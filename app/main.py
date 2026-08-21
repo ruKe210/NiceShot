@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 
 from app.autostart import is_enabled as autostart_enabled
 from app.autostart import set_enabled as set_autostart
-from app.config import load_config, save_config
+from app.config import DEFAULT_DISABLE_HOTKEY, DEFAULT_HOTKEY, load_config, save_config
 from app.hotkey import GlobalHotkey, format_key_event
 from app.overlay import CaptureOverlay, grab_virtual_desktop
 from app.window_detect import enum_windows
@@ -76,14 +76,22 @@ def make_tray_icon() -> QIcon:
 
 
 class HotkeyDialog(QDialog):
-    def __init__(self, current: str, parent=None) -> None:
+    def __init__(
+        self,
+        current: str,
+        parent=None,
+        title: str = "设置快捷键",
+        hint: str = "请按下新的快捷键（需包含 Ctrl / Shift / Alt / Win）",
+        allow_single: bool = False,
+    ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("设置快捷键")
+        self.setWindowTitle(title)
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
         self.value = current
-        self.setFixedSize(320, 150)
+        self._allow_single = allow_single
+        self.setFixedSize(360, 160)
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("请按下新的快捷键（需包含 Ctrl / Shift / Alt / Win）"))
+        layout.addWidget(QLabel(hint))
         self.label = QLabel(current)
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setStyleSheet("font-size: 18px; padding: 12px;")
@@ -110,7 +118,7 @@ class HotkeyDialog(QDialog):
         if event.key() == Qt.Key_Escape:
             self.reject()
             return
-        formatted = format_key_event(event)
+        formatted = format_key_event(event, allow_single=self._allow_single)
         if formatted:
             self.value = formatted
             self.label.setText(formatted)
@@ -131,19 +139,27 @@ class NiceShotApp:
         hwnd = int(self.host.winId())
 
         self.hotkey = GlobalHotkey(hwnd, 1, lambda: self.start_capture(0))
-        self._register_hotkey(self.config.get("hotkey", "Ctrl+Shift+A"), warn=True)
+        self.disable_hotkey = GlobalHotkey(hwnd, 2, self.toggle_disabled)
+        if not self.config.get("disabled"):
+            self._register_hotkey(self.config.get("hotkey", DEFAULT_HOTKEY), warn=True)
+        self._register_disable_hotkey(self.config.get("disable_hotkey", DEFAULT_DISABLE_HOTKEY), warn=True)
 
         self.tray = QSystemTrayIcon(make_tray_icon(), self.app)
-        self.tray.setToolTip(f"NiceShot  {self.config.get('hotkey', '')}")
         self.menu = QMenu()
         self.act_capture = QAction("开始截图", self.menu)
         self.act_hotkey = QAction(self._hotkey_action_text(), self.menu)
+        self.act_disable_hotkey = QAction(self._disable_hotkey_action_text(), self.menu)
+        self.act_disabled = QAction("禁用截图", self.menu)
+        self.act_disabled.setCheckable(True)
+        self.act_disabled.setChecked(bool(self.config.get("disabled")))
         self.act_autostart = QAction("开机启动", self.menu)
         self.act_autostart.setCheckable(True)
         self.act_autostart.setChecked(autostart_enabled())
         self.act_quit = QAction("退出", self.menu)
         self.menu.addAction(self.act_capture)
         self.menu.addAction(self.act_hotkey)
+        self.menu.addAction(self.act_disable_hotkey)
+        self.menu.addAction(self.act_disabled)
         self.menu.addAction(self.act_autostart)
         self.menu.addSeparator()
         self.menu.addAction(self.act_quit)
@@ -151,13 +167,19 @@ class NiceShotApp:
 
         self.act_capture.triggered.connect(lambda: self.start_capture(150))
         self.act_hotkey.triggered.connect(self._change_hotkey)
+        self.act_disable_hotkey.triggered.connect(self._change_disable_hotkey)
+        self.act_disabled.triggered.connect(self._on_disabled_toggled)
         self.act_autostart.triggered.connect(self._toggle_autostart)
         self.act_quit.triggered.connect(self.quit)
         self.tray.activated.connect(self._on_tray_activated)
+        self._apply_disabled_ui()
         self.tray.show()
 
     def _hotkey_action_text(self) -> str:
-        return f"设置快捷键（{self.config.get('hotkey', '')}）"
+        return f"设置截图快捷键（{self.config.get('hotkey', DEFAULT_HOTKEY)}）"
+
+    def _disable_hotkey_action_text(self) -> str:
+        return f"设置禁用快捷键（{self.config.get('disable_hotkey', DEFAULT_DISABLE_HOTKEY)}）"
 
     def _register_hotkey(self, text: str, warn: bool = False) -> bool:
         try:
@@ -173,8 +195,60 @@ class NiceShotApp:
                 QMessageBox.warning(None, "NiceShot", str(exc))
             return False
 
+    def _register_disable_hotkey(self, text: str, warn: bool = False) -> bool:
+        try:
+            self.disable_hotkey.register(text)
+            return True
+        except Exception as exc:
+            if warn:
+                QTimer.singleShot(
+                    300,
+                    lambda: QMessageBox.warning(None, "NiceShot", str(exc)),
+                )
+            else:
+                QMessageBox.warning(None, "NiceShot", str(exc))
+            return False
+
+    def _is_disabled(self) -> bool:
+        return bool(self.config.get("disabled"))
+
+    def toggle_disabled(self) -> None:
+        self._set_disabled(not self._is_disabled())
+
+    def _on_disabled_toggled(self, checked: bool) -> None:
+        self._set_disabled(checked)
+
+    def _set_disabled(self, disabled: bool) -> None:
+        self.config["disabled"] = disabled
+        save_config(self.config)
+        if disabled:
+            self.hotkey.unregister()
+            if self._overlay is not None:
+                self._overlay.close()
+        else:
+            self._register_hotkey(self.config.get("hotkey", DEFAULT_HOTKEY))
+        self._apply_disabled_ui()
+        if disabled:
+            self.tray.showMessage(
+                "NiceShot",
+                f"已禁用截图，按 {self.config.get('disable_hotkey', DEFAULT_DISABLE_HOTKEY)} 可重新启用",
+                QSystemTrayIcon.Information,
+                2000,
+            )
+
+    def _apply_disabled_ui(self) -> None:
+        disabled = self._is_disabled()
+        self.act_disabled.setChecked(disabled)
+        self.act_capture.setEnabled(not disabled)
+        capture = self.config.get("hotkey", DEFAULT_HOTKEY)
+        pause = self.config.get("disable_hotkey", DEFAULT_DISABLE_HOTKEY)
+        if disabled:
+            self.tray.setToolTip(f"NiceShot 已禁用  {pause} 重新启用")
+        else:
+            self.tray.setToolTip(f"NiceShot  {capture}  禁用 {pause}")
+
     def start_capture(self, delay_ms: int = 0) -> None:
-        if self._overlay is not None:
+        if self._is_disabled() or self._overlay is not None:
             return
         if delay_ms:
             QTimer.singleShot(delay_ms, self._do_capture)
@@ -182,7 +256,7 @@ class NiceShotApp:
             self._do_capture()
 
     def _do_capture(self) -> None:
-        if self._overlay is not None:
+        if self._is_disabled() or self._overlay is not None:
             return
         screenshot, origin = grab_virtual_desktop()
         windows = enum_windows()
@@ -205,16 +279,45 @@ class NiceShotApp:
             self.start_capture(150)
 
     def _change_hotkey(self) -> None:
-        dialog = HotkeyDialog(self.config.get("hotkey", "Ctrl+Shift+A"))
+        dialog = HotkeyDialog(self.config.get("hotkey", DEFAULT_HOTKEY))
         if dialog.exec() != QDialog.Accepted:
             return
+        if dialog.value == self.config.get("disable_hotkey"):
+            QMessageBox.warning(None, "NiceShot", "不能和禁用快捷键相同。")
+            return
+        if self._is_disabled():
+            self.config["hotkey"] = dialog.value
+            save_config(self.config)
+            self.act_hotkey.setText(self._hotkey_action_text())
+            self._apply_disabled_ui()
+            return
         if not self._register_hotkey(dialog.value):
-            self._register_hotkey(self.config.get("hotkey", "Ctrl+Shift+A"))
+            self._register_hotkey(self.config.get("hotkey", DEFAULT_HOTKEY))
             return
         self.config["hotkey"] = dialog.value
         save_config(self.config)
         self.act_hotkey.setText(self._hotkey_action_text())
-        self.tray.setToolTip(f"NiceShot  {dialog.value}")
+        self._apply_disabled_ui()
+
+    def _change_disable_hotkey(self) -> None:
+        dialog = HotkeyDialog(
+            self.config.get("disable_hotkey", DEFAULT_DISABLE_HOTKEY),
+            title="设置禁用快捷键",
+            hint="请按下开关快捷键（单键如 F8，或 Ctrl+Shift+D 这类组合键）",
+            allow_single=True,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        if dialog.value == self.config.get("hotkey"):
+            QMessageBox.warning(None, "NiceShot", "不能和截图快捷键相同。")
+            return
+        if not self._register_disable_hotkey(dialog.value):
+            self._register_disable_hotkey(self.config.get("disable_hotkey", DEFAULT_DISABLE_HOTKEY))
+            return
+        self.config["disable_hotkey"] = dialog.value
+        save_config(self.config)
+        self.act_disable_hotkey.setText(self._disable_hotkey_action_text())
+        self._apply_disabled_ui()
 
     def _toggle_autostart(self, checked: bool) -> None:
         try:
@@ -227,6 +330,7 @@ class NiceShotApp:
 
     def quit(self) -> None:
         self.hotkey.unregister()
+        self.disable_hotkey.unregister()
         if self._overlay is not None:
             self._overlay.close()
         self.tray.hide()
