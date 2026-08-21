@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from io import BytesIO
 
 import mss
@@ -12,6 +13,7 @@ from app.clipboard_win import copy_image
 from app.magnifier import Magnifier
 from app.ocr_engine import recognize
 from app.result_dialog import ResultDialog, show_error
+from app.scroll_capture import ScrollCapturePanel
 from app.toolbar import CaptureToolbar
 from app.translator import translate
 from app.window_detect import OVERLAY_TITLE, hit_test
@@ -19,6 +21,27 @@ from app.window_detect import OVERLAY_TITLE, hit_test
 DRAG_THRESHOLD = 4
 ACCENT = QColor(51, 112, 255)
 DIM = QColor(0, 0, 0, 125)
+HANDLE_HIT = 8
+HANDLE_SIZE = 7
+HANDLES = ("nw", "n", "ne", "e", "se", "s", "sw", "w")
+HANDLE_CURSOR = {
+    "nw": Qt.SizeFDiagCursor,
+    "se": Qt.SizeFDiagCursor,
+    "ne": Qt.SizeBDiagCursor,
+    "sw": Qt.SizeBDiagCursor,
+    "n": Qt.SizeVerCursor,
+    "s": Qt.SizeVerCursor,
+    "e": Qt.SizeHorCursor,
+    "w": Qt.SizeHorCursor,
+}
+
+
+@dataclass
+class Annotation:
+    kind: str
+    rect: QRect
+    color: QColor
+    width: int
 
 
 def grab_virtual_desktop() -> tuple[QPixmap, QPoint]:
@@ -82,6 +105,15 @@ class CaptureOverlay(QWidget):
         self._dragging = False
         self._finalized = False
         self._worker: Worker | None = None
+        self._scroll: ScrollCapturePanel | None = None
+        self._tool = ""
+        self._pen_color = QColor("#E85454")
+        self._pen_width = 4
+        self._annots: list[Annotation] = []
+        self._draw_start: QPoint | None = None
+        self._draft: QRect | None = None
+        self._resize_handle: str | None = None
+        self._resize_origin: QRect | None = None
 
         self.setWindowTitle(OVERLAY_TITLE)
         self.setWindowFlags(
@@ -99,6 +131,11 @@ class CaptureOverlay(QWidget):
         self.toolbar.hide()
         self.toolbar.ocr_clicked.connect(self._on_ocr)
         self.toolbar.translate_clicked.connect(self._on_translate)
+        self.toolbar.scroll_clicked.connect(self._on_scroll)
+        self.toolbar.tool_changed.connect(self._on_tool_changed)
+        self.toolbar.color_changed.connect(self._on_color_changed)
+        self.toolbar.width_changed.connect(self._on_width_changed)
+        self.toolbar.undo_clicked.connect(self._undo_annot)
         self.toolbar.confirm_clicked.connect(self._on_confirm)
         self.toolbar.cancel_requested.connect(self.cancel)
 
@@ -114,6 +151,9 @@ class CaptureOverlay(QWidget):
     def closeEvent(self, event) -> None:
         if self._worker is not None and self._worker.isRunning():
             self._worker.wait(50)
+        if self._scroll is not None:
+            self._scroll.close()
+            self._scroll = None
         self.closed.emit()
         super().closeEvent(event)
 
@@ -124,13 +164,36 @@ class CaptureOverlay(QWidget):
         if event.key() in (Qt.Key_Return, Qt.Key_Enter) and self._selection:
             self._on_confirm()
             return
+        if event.key() == Qt.Key_Z and event.modifiers() & Qt.ControlModifier:
+            self._undo_annot()
+            return
+        if event.key() == Qt.Key_C and event.modifiers() & Qt.ControlModifier:
+            self._copy_color()
+            return
+        if event.key() == Qt.Key_Shift and not event.isAutoRepeat():
+            self.magnifier.toggle_mode()
+            return
         super().keyPressEvent(event)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.RightButton:
             self.cancel()
             return
-        if event.button() != Qt.LeftButton or self._finalized:
+        if event.button() != Qt.LeftButton:
+            return
+        if self._finalized:
+            handle = self._hit_handle(event.pos())
+            if handle and self._selection:
+                self._resize_handle = handle
+                self._resize_origin = QRect(self._selection)
+                return
+            if (
+                self._tool
+                and self._selection
+                and self._selection.contains(event.pos())
+            ):
+                self._draw_start = event.pos()
+                self._draft = None
             return
         self._press = event.pos()
         self._dragging = False
@@ -139,6 +202,23 @@ class CaptureOverlay(QWidget):
 
     def mouseMoveEvent(self, event) -> None:
         pos = event.pos()
+        if self._finalized and self._resize_handle and self._resize_origin:
+            self._selection = self._resize_rect(self._resize_handle, pos, self._resize_origin)
+            self._place_toolbar()
+            self._update_magnifier(pos, (self._selection.width(), self._selection.height()))
+            self.update()
+            return
+        if self._finalized and self._draw_start is not None and self._selection:
+            self._draft = self._norm_rect(self._draw_start, pos).intersected(self._selection)
+            self.magnifier.hide()
+            self.update()
+            return
+        if self._finalized:
+            self._apply_hover_cursor(pos)
+            sel_size = (self._selection.width(), self._selection.height()) if self._selection else None
+            self._update_magnifier(pos, sel_size)
+            self.update()
+            return
         sel_size = None
         if self._press is not None and not self._finalized:
             delta = pos - self._press
@@ -154,10 +234,31 @@ class CaptureOverlay(QWidget):
         self.update()
 
     def mouseReleaseEvent(self, event) -> None:
-        if event.button() != Qt.LeftButton or self._press is None:
+        if event.button() != Qt.LeftButton:
             return
         if self._finalized:
-            self._press = None
+            if self._resize_handle:
+                self._resize_handle = None
+                self._resize_origin = None
+                self._place_toolbar()
+                self._update_magnifier(event.pos(), None)
+                self.update()
+                return
+            if self._draw_start is not None and self._draft and self._draft.width() > 2 and self._draft.height() > 2:
+                self._annots.append(
+                    Annotation(
+                        self._tool,
+                        QRect(self._draft),
+                        QColor(self._pen_color),
+                        self._pen_width,
+                    )
+                )
+            self._draw_start = None
+            self._draft = None
+            self._update_magnifier(event.pos(), None)
+            self.update()
+            return
+        if self._press is None:
             return
         if self._dragging and self._selection is not None:
             self._finalize(self._selection)
@@ -200,10 +301,10 @@ class CaptureOverlay(QWidget):
         self._selection = rect
         self._finalized = True
         self._hover = None
-        self.magnifier.hide()
         self.toolbar.show()
         self.toolbar.raise_()
         self._place_toolbar()
+        self._apply_hover_cursor(self.mapFromGlobal(QCursor.pos()))
         self.update()
 
     def _place_toolbar(self) -> None:
@@ -226,13 +327,85 @@ class CaptureOverlay(QWidget):
             y = min(sel.bottom() + gap, bounds.bottom() - th)
         self.toolbar.move(max(0, x), max(0, y))
 
+    def _copy_color(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        QApplication.clipboard().setText(self.magnifier.color_code())
+        self.magnifier.mark_copied()
+
     def _update_magnifier(self, pos: QPoint, sel_size: tuple[int, int] | None) -> None:
-        if self._finalized:
+        if self._draw_start is not None:
+            self.magnifier.hide()
             return
         self.magnifier.show()
         self.magnifier.raise_()
         self.magnifier.update_at(pos, sel_size)
         self.magnifier.place_near(pos, self.rect())
+
+    def _handle_points(self, rect: QRect) -> dict[str, QPoint]:
+        cx, cy = rect.center().x(), rect.center().y()
+        return {
+            "nw": rect.topLeft(),
+            "n": QPoint(cx, rect.top()),
+            "ne": QPoint(rect.right(), rect.top()),
+            "e": QPoint(rect.right(), cy),
+            "se": rect.bottomRight(),
+            "s": QPoint(cx, rect.bottom()),
+            "sw": QPoint(rect.left(), rect.bottom()),
+            "w": QPoint(rect.left(), cy),
+        }
+
+    def _hit_handle(self, pos: QPoint) -> str | None:
+        if not self._selection:
+            return None
+        points = self._handle_points(self._selection)
+        for name in ("nw", "ne", "se", "sw", "n", "s", "e", "w"):
+            pt = points[name]
+            if abs(pos.x() - pt.x()) <= HANDLE_HIT and abs(pos.y() - pt.y()) <= HANDLE_HIT:
+                return name
+        rect = self._selection
+        x, y = pos.x(), pos.y()
+        inside_x = rect.left() - HANDLE_HIT <= x <= rect.right() + HANDLE_HIT
+        inside_y = rect.top() - HANDLE_HIT <= y <= rect.bottom() + HANDLE_HIT
+        if inside_x and abs(y - rect.top()) <= HANDLE_HIT:
+            return "n"
+        if inside_x and abs(y - rect.bottom()) <= HANDLE_HIT:
+            return "s"
+        if inside_y and abs(x - rect.left()) <= HANDLE_HIT:
+            return "w"
+        if inside_y and abs(x - rect.right()) <= HANDLE_HIT:
+            return "e"
+        return None
+
+    def _resize_rect(self, handle: str, pos: QPoint, origin: QRect) -> QRect:
+        left, top = origin.left(), origin.top()
+        right, bottom = origin.right(), origin.bottom()
+        if handle in {"nw", "w", "sw"}:
+            left = pos.x()
+        if handle in {"ne", "e", "se"}:
+            right = pos.x()
+        if handle in {"nw", "n", "ne"}:
+            top = pos.y()
+        if handle in {"sw", "s", "se"}:
+            bottom = pos.y()
+        return self._norm_rect(QPoint(left, top), QPoint(right, bottom))
+
+    def _apply_hover_cursor(self, pos: QPoint) -> None:
+        handle = self._hit_handle(pos)
+        if handle:
+            self.setCursor(HANDLE_CURSOR[handle])
+        elif self._tool:
+            self.setCursor(Qt.CrossCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+
+    def _draw_handles(self, painter: QPainter, rect: QRect) -> None:
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setPen(QPen(ACCENT, 1))
+        painter.setBrush(QColor(255, 255, 255))
+        half = HANDLE_SIZE // 2
+        for pt in self._handle_points(rect).values():
+            painter.drawRect(pt.x() - half, pt.y() - half, HANDLE_SIZE, HANDLE_SIZE)
 
     def _norm_rect(self, p1: QPoint, p2: QPoint) -> QRect:
         x1, x2 = sorted((p1.x(), p2.x()))
@@ -240,10 +413,87 @@ class CaptureOverlay(QWidget):
         rect = QRect(x1, y1, x2 - x1 + 1, y2 - y1 + 1)
         return rect.intersected(self.rect())
 
+    def _on_tool_changed(self, tool: str) -> None:
+        self._tool = tool
+        self._pen_color = self.toolbar.current_color()
+        self._pen_width = self.toolbar.current_width()
+        self.setCursor(Qt.CrossCursor if tool else Qt.ArrowCursor)
+        self._place_toolbar()
+
+    def _on_color_changed(self, color: QColor) -> None:
+        self._pen_color = QColor(color)
+
+    def _on_width_changed(self, width: int) -> None:
+        self._pen_width = int(width)
+
+    def _undo_annot(self) -> None:
+        if self._annots:
+            self._annots.pop()
+            self.update()
+
+    def _draw_annotations(
+        self,
+        painter: QPainter,
+        origin: QPoint | None = None,
+        include_draft: bool = True,
+    ) -> None:
+        offset = origin or QPoint(0, 0)
+        items = list(self._annots)
+        if include_draft and self._draft is not None and self._tool:
+            items.append(
+                Annotation(self._tool, QRect(self._draft), QColor(self._pen_color), self._pen_width)
+            )
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(Qt.NoBrush)
+        for item in items:
+            rect = item.rect.translated(-offset)
+            painter.setPen(QPen(item.color, item.width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            if item.kind == "ellipse":
+                painter.drawEllipse(rect)
+            else:
+                painter.drawRect(rect.adjusted(0, 0, -1, -1))
+
     def _crop(self) -> Image.Image | None:
         if not self._selection:
             return None
-        return pixmap_to_pil(self._shot.copy(self._selection))
+        pix = self._shot.copy(self._selection)
+        if self._annots:
+            painter = QPainter(pix)
+            painter.setClipRect(QRect(0, 0, pix.width(), pix.height()))
+            self._draw_annotations(painter, self._selection.topLeft(), include_draft=False)
+            painter.end()
+        return pixmap_to_pil(pix)
+
+    def _on_scroll(self) -> None:
+        if not self._selection:
+            return
+        if self._selection.height() < 80:
+            show_error(self, "选区太矮，请框选窗口里的可滚动区域后再试。")
+            return
+        region = QRect(
+            self._selection.x() + self._origin.x(),
+            self._selection.y() + self._origin.y(),
+            self._selection.width(),
+            self._selection.height(),
+        )
+        self.hide()
+        self._scroll = ScrollCapturePanel(region)
+        self._scroll.finished.connect(self._on_scroll_done)
+        self._scroll.cancelled.connect(self.cancel)
+        self._scroll.start()
+
+    def _on_scroll_done(self, image: object) -> None:
+        if not isinstance(image, Image.Image):
+            self.cancel()
+            return
+        try:
+            copy_image(image)
+        except Exception as exc:
+            show_error(None, f"复制到剪贴板失败：{exc}")
+            self.cancel()
+            return
+        self.copied.emit()
+        self.close()
 
     def _on_confirm(self) -> None:
         image = self._crop()
@@ -318,9 +568,16 @@ class CaptureOverlay(QWidget):
         active = self._selection if (self._dragging or self._finalized) else self._hover
         if active and active.isValid():
             painter.drawPixmap(active, self._shot, active)
+            if self._finalized:
+                painter.save()
+                painter.setClipRect(active)
+                self._draw_annotations(painter)
+                painter.restore()
             painter.setPen(QPen(ACCENT, 2))
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(active.adjusted(0, 0, -1, -1))
+            if self._finalized:
+                self._draw_handles(painter, active)
 
         if not self._finalized:
             pos = self.mapFromGlobal(QCursor.pos())

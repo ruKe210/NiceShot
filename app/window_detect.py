@@ -70,7 +70,7 @@ def enum_windows() -> list[tuple[int, tuple[int, int, int, int], str]]:
         if ex_style & win32con.WS_EX_TOOLWINDOW and cls not in INCLUDE_TOOL_CLASSES:
             return True
         title = win32gui.GetWindowText(hwnd)
-        if title in {OVERLAY_TITLE, "NiceShotHost"}:
+        if title in {OVERLAY_TITLE, "NiceShotHost", "NiceShotScrollBar", "NiceShotScrollPreview"}:
             return True
         left, top, right, bottom = get_window_rect(hwnd)
         if right - left <= 2 or bottom - top <= 2:
