@@ -145,55 +145,127 @@ def detect_scroll(prev: np.ndarray, curr: np.ndarray) -> tuple[str, np.ndarray |
     return "none", None
 
 
-def _already_filled(canvas: np.ndarray, extra: np.ndarray, side: str) -> bool:
-    take = min(canvas.shape[0], extra.shape[0])
-    if take < 1:
-        return True
-    if side == "down":
-        return frames_same(canvas[-take:], extra[-take:])
-    return frames_same(canvas[:take], extra[:take])
+def _band_starts(height: int, band: int) -> list[int]:
+    if height < band:
+        return []
+    starts = [
+        0,
+        max(0, height // 5),
+        max(0, height // 2 - band // 2),
+        max(0, (height * 4) // 5 - band),
+        height - band,
+    ]
+    out: list[int] = []
+    for y in starts:
+        y = min(max(0, y), height - band)
+        if y not in out:
+            out.append(y)
+    return out
+
+
+def _agree_origin(votes: list[int]) -> int | None:
+    if not votes:
+        return None
+    best: list[int] = []
+    for vote in votes:
+        cluster = [item for item in votes if abs(item - vote) <= 2]
+        if len(cluster) > len(best):
+            best = cluster
+    if len(votes) >= 3 and len(best) < 2:
+        return None
+    return int(round(sum(best) / len(best)))
+
+
+def find_frame_origin(
+    canvas: np.ndarray,
+    frame: np.ndarray,
+    hint: int | None = None,
+) -> int | None:
+    """当前帧顶边在长图坐标系里的 Y。负数表示比已有内容更靠上。"""
+    if canvas.shape[1] != frame.shape[1]:
+        frame = cv2.resize(frame, (canvas.shape[1], frame.shape[0]), interpolation=cv2.INTER_AREA)
+    left, right = _content_x(canvas.shape[1])
+    canvas_c = canvas[:, left:right]
+    frame_c = frame[:, left:right]
+    h1, h2 = canvas_c.shape[0], frame_c.shape[0]
+    votes: list[int] = []
+    for band in (80, 48, MIN_BAND):
+        if h1 < band or h2 < band:
+            continue
+        for fy in _band_starts(h2, band):
+            y = _verified_y(canvas_c, frame_c[fy : fy + band])
+            if y is not None:
+                votes.append(y - fy)
+        for cy in _band_starts(h1, band):
+            if hint is not None and not (hint - h2 - 8 <= cy <= hint + h2 + 8):
+                continue
+            y = _verified_y(frame_c, canvas_c[cy : cy + band])
+            if y is not None:
+                votes.append(cy - y)
+        origin = _agree_origin(votes)
+        if origin is not None:
+            return origin
+    return _agree_origin(votes)
+
+
+def place_frame(
+    canvas: np.ndarray,
+    frame: np.ndarray,
+    origin: int,
+) -> tuple[np.ndarray, str, int]:
+    """按垂直坐标把当前帧贴进长图，只补超出已覆盖区间的像素。"""
+    if canvas.shape[1] != frame.shape[1]:
+        frame = cv2.resize(frame, (canvas.shape[1], frame.shape[0]), interpolation=cv2.INTER_AREA)
+    h1, h2 = canvas.shape[0], frame.shape[0]
+    frame_bot = origin + h2
+    pad_top = max(0, -origin)
+    pad_bot = max(0, frame_bot - h1)
+    if pad_top == 0 and pad_bot == 0:
+        return canvas, "none", origin
+    out = np.empty((h1 + pad_top + pad_bot, canvas.shape[1], canvas.shape[2]), canvas.dtype)
+    if pad_top:
+        out[:pad_top] = frame[:pad_top]
+    out[pad_top : pad_top + h1] = canvas
+    if pad_bot:
+        src = h1 - origin
+        out[pad_top + h1 :] = frame[src : src + pad_bot]
+    direction = "up" if pad_top else "down"
+    return out, direction, origin + pad_top
 
 
 def stitch_vertical(
     canvas: np.ndarray,
     frame: np.ndarray,
     prev_frame: np.ndarray | None = None,
-) -> tuple[np.ndarray, str]:
-    """只拼接超出已记录顶/底边界的新内容，在已覆盖范围内来回滚不重复加长。"""
-    del prev_frame
+    last_origin: int = 0,
+) -> tuple[np.ndarray, str, int]:
+    """算出新帧顶边的垂直坐标，按坐标贴入，只增加尚未覆盖的区间。"""
     if canvas.shape[1] != frame.shape[1]:
         frame = cv2.resize(frame, (canvas.shape[1], frame.shape[0]), interpolation=cv2.INTER_AREA)
-    if frames_same(canvas[: frame.shape[0]], frame) if canvas.shape[0] >= frame.shape[0] else False:
-        return canvas, "none"
-    if canvas.shape[0] >= frame.shape[0] and frames_same(canvas[-frame.shape[0] :], frame):
-        return canvas, "none"
+    if canvas.shape[0] >= frame.shape[0]:
+        if frames_same(canvas[: frame.shape[0]], frame) or frames_same(canvas[-frame.shape[0] :], frame):
+            origin = 0 if frames_same(canvas[: frame.shape[0]], frame) else canvas.shape[0] - frame.shape[0]
+            return canvas, "none", origin
 
-    left, right = _content_x(canvas.shape[1])
-    h1, h2 = canvas.shape[0], frame.shape[0]
-    extra_up = extra_down = None
-    for band in (120, 80, 48, MIN_BAND):
-        if h1 < band or h2 < band:
-            continue
-        search = frame[:, left:right]
-        y_bot = _verified_y(search, canvas[-band:, left:right])
-        if y_bot is not None:
-            start = y_bot + band
-            if start < h2:
-                extra_down = frame[start:]
-        y_top = _verified_y(search, canvas[:band, left:right])
-        if y_top is not None and y_top > 0:
-            extra_up = frame[:y_top]
-        if extra_down is not None or extra_up is not None:
-            break
+    hinted: int | None = None
+    if prev_frame is not None:
+        rel = find_frame_origin(prev_frame, frame)
+        if rel is not None:
+            hinted = last_origin + rel
+            if 0 <= hinted and hinted + frame.shape[0] <= canvas.shape[0]:
+                return canvas, "none", hinted
 
-    direction = "none"
-    if extra_down is not None and extra_down.shape[0] > 0 and not _already_filled(canvas, extra_down, "down"):
-        canvas = np.vstack([canvas, extra_down])
-        direction = "down"
-    if extra_up is not None and extra_up.shape[0] > 0 and not _already_filled(canvas, extra_up, "up"):
-        canvas = np.vstack([extra_up, canvas])
-        direction = "up" if direction == "none" else direction
-    return canvas, direction
+    origin = find_frame_origin(canvas, frame, hint=hinted)
+    if origin is None:
+        origin = hinted
+    if origin is None:
+        return canvas, "none", last_origin
+    pad_top = max(0, -origin)
+    pad_bot = max(0, origin + frame.shape[0] - canvas.shape[0])
+    if hinted is not None and max(pad_top, pad_bot) > frame.shape[0] * 0.55:
+        if abs(origin - hinted) > 4:
+            origin = hinted
+    return place_frame(canvas, frame, origin)
 
 
 def focus_window_at(point: QPoint) -> None:
@@ -293,6 +365,7 @@ class ScrollCapturePanel(QWidget):
         self._region = QRect(region)
         self._canvas: np.ndarray | None = None
         self._last: np.ndarray | None = None
+        self._frame_origin = 0
         self._same_count = 0
         self._auto = False
         self._busy = False
@@ -364,6 +437,7 @@ class ScrollCapturePanel(QWidget):
         first = grab_region(self._region)
         self._last = _to_bgr(first)
         self._canvas = self._last.copy()
+        self._frame_origin = 0
         self._update_hint("none")
         self._refresh_preview()
         self._timer.start()
@@ -418,8 +492,11 @@ class ScrollCapturePanel(QWidget):
             return
 
         self._same_count = 0
-        merged, direction = stitch_vertical(self._canvas, frame, self._last)
+        merged, direction, origin = stitch_vertical(
+            self._canvas, frame, self._last, self._frame_origin
+        )
         self._last = frame
+        self._frame_origin = origin
         if merged.shape[0] > MAX_HEIGHT:
             self._canvas = merged[:MAX_HEIGHT] if direction != "down" else merged[-MAX_HEIGHT:]
             self._timer.stop()
