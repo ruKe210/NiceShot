@@ -22,13 +22,18 @@ PREVIEW_MIN_WIDTH = 64
 MAX_HEIGHT = 32000
 SIDE_MARGIN = 16
 MIN_BAND = 24
-MIN_OVERLAP = 24
+MIN_OVERLAP = 12
 INSET_RATIO = 0.1
 ROW_TOL = 10.0
-TICK_MS = 32
+ROW_STRIDE = 4
+TICK_MS = 16
+CAPTURE_HZ = 1000 / TICK_MS
 PREVIEW_MS = 80
 DELTA_GOOD = 1.8
 DELTA_ACCEPT = 10.0
+IDLE_DIFF = 5.5
+MIN_GROW = 3
+STRIP_TOL = 3.0
 BLUR_RATIO = 0.5
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
 _sct = None
@@ -91,6 +96,11 @@ def frames_same(a: np.ndarray, b: np.ndarray, mean_diff: float = 1.8) -> bool:
     if a.shape != b.shape:
         return False
     return float(np.mean(np.abs(a.astype(np.int16) - b.astype(np.int16)))) < mean_diff
+
+
+def frames_idle(a: np.ndarray, b: np.ndarray) -> bool:
+    """到边界时画面几乎不动，但光标/滚动条会让 frames_same 失败。"""
+    return frames_same(a, b, IDLE_DIFF)
 
 
 def _mae(a: np.ndarray, b: np.ndarray) -> float:
@@ -272,12 +282,52 @@ def find_scroll_delta(prev: np.ndarray, curr: np.ndarray, predict: int = 0) -> i
 
 def _row_strip(image: np.ndarray, y: int) -> np.ndarray:
     left, right = _content_x(image.shape[1])
-    return image[y, left:right].astype(np.int16)
+    return image[y, left:right:ROW_STRIDE].astype(np.int16)
+
+
+def _row_mae_map(image: np.ndarray, needle: np.ndarray, y0: int, y1: int) -> np.ndarray:
+    left, right = _content_x(image.shape[1])
+    block = image[y0:y1, left:right:ROW_STRIDE].astype(np.int16)
+    if block.size == 0 or needle.size == 0 or block.shape[1] != needle.shape[0]:
+        return np.full(max(0, y1 - y0), 1e9, np.float64)
+    return np.mean(np.abs(block - needle), axis=(1, 2))
 
 
 def compare_row(left: np.ndarray, right: np.ndarray, y_left: int, y_right: int) -> float:
     """文章里的 CompareRow：比较两图指定行，返回平均色差。"""
     return float(np.mean(np.abs(_row_strip(left, y_left) - _row_strip(right, y_right))))
+
+
+def _sticky_bands(prev: np.ndarray, curr: np.ndarray) -> tuple[int, int]:
+    """相邻帧里位置不变的顶/底行数（吸顶栏、底栏）。整屏都没动则视为 0，交给 idle。"""
+    if prev.shape[0] != curr.shape[0] or prev.shape[1] != curr.shape[1]:
+        inset = _inset(min(prev.shape[0], curr.shape[0]))
+        return inset, inset
+    height = prev.shape[0]
+    top = 0
+    for y in range(height):
+        if compare_row(prev, curr, y, y) <= ROW_TOL:
+            top += 1
+        else:
+            break
+    bot = 0
+    for y in range(height - 1, -1, -1):
+        if compare_row(prev, curr, y, y) <= ROW_TOL:
+            bot += 1
+        else:
+            break
+    if top + bot >= height - 2:
+        return 0, 0
+    limit = max(0, (height - MIN_OVERLAP) // 2)
+    return min(top, limit), min(bot, limit)
+
+
+def _body_view(image: np.ndarray, top: int, bot: int) -> np.ndarray:
+    bot = min(bot, max(0, image.shape[0] - top - MIN_OVERLAP))
+    top = min(top, max(0, image.shape[0] - MIN_OVERLAP))
+    if top <= 0 and bot <= 0:
+        return image
+    return image[top : image.shape[0] - bot]
 
 
 def _verify_overlap(base: np.ndarray, y0: int, nxt: np.ndarray, n0: int, height: int) -> float:
@@ -288,73 +338,176 @@ def _verify_overlap(base: np.ndarray, y0: int, nxt: np.ndarray, n0: int, height:
     return float(np.mean(diffs))
 
 
+def _pick_overlap(hits: list[tuple[float, int]]) -> tuple[int | None, float]:
+    if not hits:
+        return None, 1e9
+    best = min(score for score, _overlap in hits)
+    overlap = max(h for score, h in hits if score <= best + 0.4)
+    return overlap, best
+
+
 def find_overlap_down(base: np.ndarray, nxt: np.ndarray) -> tuple[int | None, float]:
     """文章里的 FindOverlap：base 底部与 next 顶部重合多少行。"""
     view = base[-min(base.shape[0], nxt.shape[0]) :]
     vh, h2 = view.shape[0], nxt.shape[0]
     inset = min(_inset(h2), max(0, h2 // 8))
+    errs = _row_mae_map(view, _row_strip(nxt, 0), 0, max(0, vh - MIN_OVERLAP + 1))
     hits: list[tuple[float, int]] = []
-    for y in range(0, vh - MIN_OVERLAP + 1):
-        if compare_row(view, nxt, y, 0) > ROW_TOL:
-            continue
+    for y in np.flatnonzero(errs <= ROW_TOL):
+        y = int(y)
         if inset and y + inset < vh and inset < h2 and compare_row(view, nxt, y + inset, inset) > ROW_TOL:
             continue
         overlap = vh - y
         score = _verify_overlap(view, y, nxt, 0, min(overlap, 56))
         if score <= ROW_TOL:
             hits.append((score, overlap))
-    if not hits:
-        return None, 1e9
-    best = min(score for score, _overlap in hits)
-    overlap = max(h for score, h in hits if score <= best + 0.4)
-    return overlap, best
+    return _pick_overlap(hits)
 
 
 def find_overlap_up(base: np.ndarray, nxt: np.ndarray) -> tuple[int | None, float]:
     """对称：base 顶部与 next 底部重合多少行（往上滚）。"""
     view = base[: min(base.shape[0], nxt.shape[0])]
     vh, h2 = view.shape[0], nxt.shape[0]
+    errs = _row_mae_map(nxt, _row_strip(view, 0), 0, max(0, h2 - MIN_OVERLAP + 1))
     hits: list[tuple[float, int]] = []
-    for extra in range(0, h2 - MIN_OVERLAP + 1):
+    for extra in np.flatnonzero(errs <= ROW_TOL):
+        extra = int(extra)
         overlap = h2 - extra
         if overlap > vh:
-            continue
-        if compare_row(view, nxt, 0, extra) > ROW_TOL:
             continue
         score = _verify_overlap(view, 0, nxt, extra, min(overlap, 56))
         if score <= ROW_TOL:
             hits.append((score, overlap))
+    return _pick_overlap(hits)
+
+
+def _origin_fit(canvas: np.ndarray, frame: np.ndarray, origin: int) -> float:
+    src0 = max(0, -origin)
+    dst0 = max(0, origin)
+    overlap = min(frame.shape[0] - src0, canvas.shape[0] - dst0)
+    if overlap < MIN_OVERLAP:
+        return 1e9
+    skip = min(_inset(frame.shape[0]), max(0, overlap // 5))
+    return _verify_overlap(canvas, dst0 + skip, frame, src0 + skip, min(overlap - skip, 80))
+
+
+def find_signed_delta(
+    prev: np.ndarray,
+    curr: np.ndarray,
+    predict: int = 0,
+    canvas: np.ndarray | None = None,
+    last_origin: int = 0,
+) -> tuple[int | None, float]:
+    """相邻帧位移：正数往下翻，负数往上翻。固定顶/底栏不参与重叠。"""
+    if prev.shape[1] != curr.shape[1]:
+        curr = cv2.resize(curr, (prev.shape[1], curr.shape[0]), interpolation=cv2.INTER_AREA)
+    height = min(prev.shape[0], curr.shape[0])
+    top, bot = _sticky_bands(prev, curr)
+    prev_b = _body_view(prev, top, bot)
+    curr_b = _body_view(curr, top, bot)
+    down_h, down_s = find_overlap_down(prev_b, curr_b)
+    up_h, up_s = find_overlap_up(prev_b, curr_b)
+    height = min(prev_b.shape[0], curr_b.shape[0])
+    down_d = height - down_h if down_h is not None else None
+    up_d = -(height - up_h) if up_h is not None else None
+    if down_d is None and up_d is None:
+        return None, 1e9
+    if down_d is None:
+        return up_d, up_s
+    if up_d is None:
+        return down_d, down_s
+    if canvas is not None and abs(down_s - up_s) <= 1.2:
+        down_fit = _origin_fit(canvas, curr, last_origin + down_d)
+        up_fit = _origin_fit(canvas, curr, last_origin + up_d)
+        if down_fit < up_fit:
+            return down_d, down_s
+        if up_fit < down_fit:
+            return up_d, up_s
+    if abs(down_s - up_s) <= 1.2:
+        if abs(abs(down_d) - abs(up_d)) <= 8:
+            if predict > 2:
+                return down_d, down_s
+            if predict < -2:
+                return up_d, up_s
+        if abs(down_d) <= abs(up_d):
+            return down_d, down_s
+        return up_d, up_s
+    return (up_d, up_s) if up_s < down_s else (down_d, down_s)
+
+
+def locate_frame(
+    canvas: np.ndarray,
+    frame: np.ndarray,
+    hint_origin: int,
+) -> tuple[int | None, float]:
+    """翻太快、相邻帧对不上时，在长图里重定位当前屏。"""
+    if canvas.shape[1] != frame.shape[1]:
+        frame = cv2.resize(frame, (canvas.shape[1], frame.shape[0]), interpolation=cv2.INTER_AREA)
+    h1, h2 = canvas.shape[0], frame.shape[0]
+    inset = _inset(h2)
+    probes = sorted(
+        {
+            p
+            for p in (inset + 4, inset + 8, h2 // 2, max(inset, h2 - inset - 8), h2 - inset - 4)
+            if inset <= p < h2 - max(0, inset - 1)
+        }
+    )
+    ranges: list[tuple[int, int]] = []
+
+    def add_range(a: int, b: int) -> None:
+        a, b = max(0, a), min(h1, b)
+        if b > a:
+            ranges.append((a, b))
+
+    add_range(hint_origin - 2 * h2, hint_origin + 3 * h2)
+    add_range(0, 2 * h2)
+    add_range(h1 - 2 * h2, h1)
+
+    hits: list[tuple[float, int]] = []
+    seen: set[int] = set()
+    for probe in probes:
+        needle = _row_strip(frame, probe)
+        for lo, hi in ranges:
+            errs = _row_mae_map(canvas, needle, lo, hi)
+            for i in np.flatnonzero(errs <= ROW_TOL):
+                origin = lo + int(i) - probe
+                if origin in seen:
+                    continue
+                seen.add(origin)
+                src0 = max(0, -origin)
+                dst0 = max(0, origin)
+                overlap = min(h2 - src0, h1 - dst0)
+                if overlap < MIN_OVERLAP:
+                    continue
+                skip = min(inset, max(0, overlap // 4))
+                score = _verify_overlap(
+                    canvas, dst0 + skip, frame, src0 + skip, min(max(1, overlap - skip), 56)
+                )
+                if score <= ROW_TOL:
+                    hits.append((score, origin))
     if not hits:
         return None, 1e9
-    best = min(score for score, _overlap in hits)
-    overlap = max(h for score, h in hits if score <= best + 0.4)
-    return overlap, best
+    best = min(score for score, _origin in hits)
+    good = [(score, origin) for score, origin in hits if score <= best + 0.6]
+    origin = min(good, key=lambda item: abs(item[1] - hint_origin))[1]
+    return origin, best
 
 
-def combine_down(base: np.ndarray, nxt: np.ndarray, overlap: int) -> tuple[np.ndarray, str]:
-    """文章里的 CombineImages：next 画在 (0, baseH - overlap)。"""
-    extra = nxt.shape[0] - overlap
-    if extra <= 1:
-        out = base.copy()
-        top = max(0, base.shape[0] - nxt.shape[0])
-        out[top : top + nxt.shape[0]] = nxt
-        return out, "refresh"
-    out = np.empty((base.shape[0] + extra, base.shape[1], base.shape[2]), base.dtype)
-    out[: base.shape[0]] = base
-    out[base.shape[0] - overlap :] = nxt
-    return out, "down"
-
-
-def combine_up(base: np.ndarray, nxt: np.ndarray, overlap: int) -> tuple[np.ndarray, str]:
-    extra = nxt.shape[0] - overlap
-    if extra <= 1:
-        out = base.copy()
-        out[: nxt.shape[0]] = nxt[: min(nxt.shape[0], out.shape[0])]
-        return out, "refresh"
-    out = np.empty((base.shape[0] + extra, base.shape[1], base.shape[2]), base.dtype)
-    out[extra:] = base
-    out[: nxt.shape[0]] = nxt
-    return out, "up"
+def _origin_from_canvas_edge(canvas: np.ndarray, frame: np.ndarray) -> tuple[int | None, float, int]:
+    """相邻帧和长图内部都对不上时，再试长图顶/底（刚翻出已截范围）。"""
+    down_h, down_s = find_overlap_down(canvas, frame)
+    up_h, up_s = find_overlap_up(canvas, frame)
+    down_o = canvas.shape[0] - down_h if down_h is not None else None
+    up_o = (up_h - frame.shape[0]) if up_h is not None else None
+    if down_o is None and up_o is None:
+        return None, 1e9, 0
+    if down_o is None:
+        return up_o, up_s, up_o or 0
+    if up_o is None:
+        return down_o, down_s, down_o - (canvas.shape[0] - frame.shape[0])
+    if down_s <= up_s:
+        return down_o, down_s, down_o - (canvas.shape[0] - frame.shape[0])
+    return up_o, up_s, up_o
 
 
 def looks_like_render(prev: np.ndarray, curr: np.ndarray) -> bool:
@@ -368,13 +521,15 @@ def refresh_viewport(
     canvas: np.ndarray,
     frame: np.ndarray,
     origin: int,
+    top: int = 0,
+    bot: int = 0,
 ) -> tuple[np.ndarray, bool]:
-    """同一视口再截一次：内容加载完后覆盖长图上对应区域。"""
+    """同一视口再截一次：内容加载完后覆盖长图上对应区域。固定栏不覆盖进正文。"""
     if canvas.shape[1] != frame.shape[1]:
         frame = cv2.resize(frame, (canvas.shape[1], frame.shape[0]), interpolation=cv2.INTER_AREA)
-    src0 = max(0, -origin)
-    dst0 = max(0, origin)
-    copy_h = min(frame.shape[0] - src0, canvas.shape[0] - dst0)
+    src0 = max(0, -origin) + top
+    dst0 = max(0, origin) + top
+    copy_h = min(frame.shape[0] - bot - src0, canvas.shape[0] - bot - dst0)
     if copy_h < 12:
         return canvas, False
     old = canvas[dst0 : dst0 + copy_h]
@@ -389,29 +544,146 @@ def refresh_viewport(
     return canvas, True
 
 
+def _overlaps_canvas(canvas_h: int, frame_h: int, origin: int) -> bool:
+    return origin < canvas_h and origin + frame_h > 0
+
+
+def _fully_contained(
+    canvas: np.ndarray,
+    frame: np.ndarray,
+    hint: int,
+    located: int | None,
+    skip_top: int = 0,
+    skip_bot: int = 0,
+) -> int | None:
+    """当前屏的滚动内容是否已经完整落在长图里。固定顶/底栏不参与判断。"""
+    h1, h2 = canvas.shape[0], frame.shape[0]
+    if h1 < h2:
+        return None
+    skip_top = max(skip_top, _inset(h2))
+    skip_bot = max(skip_bot, _inset(h2))
+    body_h = h2 - skip_top - skip_bot
+    if body_h < MIN_OVERLAP:
+        return None
+    max_inside = h1 - h2
+    origins = {0, max_inside, int(np.clip(hint, 0, max_inside))}
+    if located is not None and 0 <= located <= max_inside:
+        origins.add(int(located))
+    best_o, best_s = None, 1e9
+    for origin in origins:
+        score = _verify_overlap(canvas, origin + skip_top, frame, skip_top, min(body_h, 80))
+        if score < best_s:
+            best_s, best_o = score, origin
+    if best_o is not None and best_s <= ROW_TOL:
+        return best_o
+    return None
+
+
+def _strip_already_in_canvas(canvas: np.ndarray, extra: np.ndarray, side: str) -> bool:
+    """拟新增条带是否已在长图顶/底（到边界后回弹、重复接）。"""
+    eh = extra.shape[0]
+    if eh < MIN_GROW:
+        return True
+    if eh > canvas.shape[0]:
+        return False
+    if side == "bottom":
+        if _mae(canvas[-eh:], extra) <= STRIP_TOL:
+            return True
+        span = min(eh + 12, canvas.shape[0] - eh)
+        for off in range(1, max(1, span)):
+            if _mae(canvas[-eh - off : canvas.shape[0] - off], extra) <= STRIP_TOL:
+                return True
+        return False
+    if _mae(canvas[:eh], extra) <= STRIP_TOL:
+        return True
+    span = min(eh + 12, canvas.shape[0] - eh)
+    for off in range(1, max(1, span)):
+        if _mae(canvas[off : off + eh], extra) <= STRIP_TOL:
+            return True
+    return False
+
+
+def _chrome_flags(canvas: np.ndarray, frame: np.ndarray, top: int, bot: int) -> tuple[bool, bool]:
+    has_header = top > 0 and canvas.shape[0] >= top and _mae(canvas[:top], frame[:top]) <= STRIP_TOL
+    has_footer = bot > 0 and canvas.shape[0] >= bot and _mae(canvas[-bot:], frame[-bot:]) <= STRIP_TOL
+    return has_header, has_footer
+
+
+def _growth_pads(
+    canvas: np.ndarray,
+    frame: np.ndarray,
+    origin: int,
+    top: int,
+    bot: int,
+) -> tuple[int, int, bool, bool]:
+    h1, h2 = canvas.shape[0], frame.shape[0]
+    has_header, has_footer = _chrome_flags(canvas, frame, top, bot)
+    body_start = top if has_header else 0
+    body_end = h1 - bot if has_footer else h1
+    pad_top = max(0, body_start - (origin + top))
+    pad_bot = max(0, origin + h2 - bot - body_end)
+    return pad_top, pad_bot, has_header, has_footer
+
+
+def _refuse_duplicate_growth(
+    canvas: np.ndarray,
+    frame: np.ndarray,
+    origin: int,
+    last_origin: int,
+    top: int = 0,
+    bot: int = 0,
+) -> tuple[int, int]:
+    """要往外接时，先确认新条带不是已截内容。固定栏不拿来当新图。"""
+    h2 = frame.shape[0]
+    pad_top, pad_bot, has_header, has_footer = _growth_pads(canvas, frame, origin, top, bot)
+    if pad_top < MIN_GROW and pad_bot < MIN_GROW:
+        if pad_top or pad_bot:
+            return last_origin, 0
+        return origin, origin - last_origin
+    if pad_bot >= MIN_GROW:
+        extra = frame[h2 - bot - pad_bot : h2 - bot]
+        check = canvas[:-bot] if has_footer and canvas.shape[0] > bot else canvas
+        if extra.shape[0] >= MIN_GROW and _strip_already_in_canvas(check, extra, "bottom"):
+            return last_origin, 0
+    if pad_top >= MIN_GROW:
+        extra = frame[top : top + pad_top]
+        check = canvas[top:] if has_header and canvas.shape[0] > top else canvas
+        if extra.shape[0] >= MIN_GROW and _strip_already_in_canvas(check, extra, "top"):
+            return last_origin, 0
+    return origin, origin - last_origin
+
+
 def place_frame(
     canvas: np.ndarray,
     frame: np.ndarray,
     origin: int,
+    top: int = 0,
+    bot: int = 0,
 ) -> tuple[np.ndarray, str, int]:
-    """按垂直坐标把当前帧贴进长图，只补超出已覆盖区间的像素。"""
+    """按垂直坐标把当前帧贴进长图；固定顶/底栏只保留一份，只补滚动内容。"""
     if canvas.shape[1] != frame.shape[1]:
         frame = cv2.resize(frame, (canvas.shape[1], frame.shape[0]), interpolation=cv2.INTER_AREA)
     h1, h2 = canvas.shape[0], frame.shape[0]
-    frame_bot = origin + h2
-    pad_top = max(0, -origin)
-    pad_bot = max(0, frame_bot - h1)
-    if pad_top == 0 and pad_bot == 0:
+    pad_top, pad_bot, has_header, has_footer = _growth_pads(canvas, frame, origin, top, bot)
+    if pad_top < MIN_GROW and pad_bot < MIN_GROW:
         return canvas, "none", origin
-    out = np.empty((h1 + pad_top + pad_bot, canvas.shape[1], canvas.shape[2]), canvas.dtype)
-    if pad_top:
-        out[:pad_top] = frame[:pad_top]
-    out[pad_top : pad_top + h1] = canvas
-    if pad_bot:
-        src = h1 - origin
-        out[pad_top + h1 :] = frame[src : src + pad_bot]
-    direction = "up" if pad_top else "down"
-    return out, direction, origin + pad_top
+    if pad_bot >= MIN_GROW:
+        extra = frame[h2 - bot - pad_bot : h2 - bot]
+        if extra.shape[0] >= MIN_GROW:
+            if has_footer:
+                out = np.concatenate([canvas[:-bot], extra, canvas[-bot:]], axis=0)
+            else:
+                out = np.concatenate([canvas, extra], axis=0)
+            return out, "down", origin
+    if pad_top >= MIN_GROW:
+        extra = frame[top : top + pad_top]
+        if extra.shape[0] >= MIN_GROW:
+            if has_header:
+                out = np.concatenate([canvas[:top], extra, canvas[top:]], axis=0)
+                return out, "up", origin + pad_top
+            out = np.concatenate([extra, canvas], axis=0)
+            return out, "up", origin + pad_top
+    return canvas, "none", origin
 
 
 def stitch_vertical(
@@ -421,48 +693,66 @@ def stitch_vertical(
     last_origin: int = 0,
     last_delta: int = 0,
 ) -> tuple[np.ndarray, str, int, int]:
-    """按知乎文：逐行找重叠高度，再 CombineImages 接到顶或底。"""
+    """相邻帧逐行求位移，按坐标只补超出已截范围的像素；来回翻不重复接。"""
     if canvas.shape[1] != frame.shape[1]:
         frame = cv2.resize(frame, (canvas.shape[1], frame.shape[0]), interpolation=cv2.INTER_AREA)
-    if frames_same(canvas[-min(canvas.shape[0], frame.shape[0]) :], frame) or (
-        canvas.shape[0] >= frame.shape[0] and frames_same(canvas[: frame.shape[0]], frame)
-    ):
-        canvas, changed = refresh_viewport(canvas, frame, last_origin)
+    top = bot = 0
+    if prev_frame is not None:
+        top, bot = _sticky_bands(prev_frame, frame)
+    if prev_frame is not None and (frames_same(prev_frame, frame) or frames_idle(prev_frame, frame)):
+        canvas, changed = refresh_viewport(canvas, frame, last_origin, top, bot)
         return canvas, ("refresh" if changed else "none"), last_origin, 0
 
-    down_h, down_s = find_overlap_down(canvas, frame)
-    up_h, up_s = find_overlap_up(canvas, frame)
-    use_up = False
-    if down_h is None and up_h is None:
-        canvas, changed = refresh_viewport(canvas, frame, last_origin)
-        return canvas, ("refresh" if changed else "none"), last_origin, last_delta
-    if down_h is None:
-        use_up = True
-    elif up_h is None:
-        use_up = False
-    elif abs(down_s - up_s) <= 1.2:
-        if last_delta < 0:
-            use_up = True
-        elif last_delta > 0:
-            use_up = False
-        else:
-            use_up = up_h > down_h
-    else:
-        use_up = up_s < down_s
+    origin = last_origin
+    delta = 0
+    dscore = 1e9
+    if prev_frame is not None:
+        signed, dscore = find_signed_delta(prev_frame, frame, last_delta, canvas, last_origin)
+        if signed is not None:
+            origin = last_origin + signed
+            delta = signed
 
-    overlap = up_h if use_up else down_h
-    if overlap is None:
-        return canvas, "none", last_origin, last_delta
-    extra = frame.shape[0] - overlap
-    if extra <= 1:
-        merged, direction = combine_up(canvas, frame, overlap) if use_up else combine_down(canvas, frame, overlap)
-        origin = 0 if use_up else max(0, merged.shape[0] - frame.shape[0])
-        return merged, direction, origin, 0
-    if use_up:
-        merged, direction = combine_up(canvas, frame, overlap)
-        return merged, direction, 0, -extra
-    merged, direction = combine_down(canvas, frame, overlap)
-    return merged, direction, merged.shape[0] - frame.shape[0], extra
+    located, lscore = locate_frame(canvas, frame, last_origin)
+    if located is not None:
+        predicted = last_origin + delta if dscore < 1e8 else last_origin
+        if dscore >= 1e8:
+            origin = located
+            delta = located - last_origin
+        elif abs(located - predicted) > 8 and lscore + 0.8 < dscore:
+            origin = located
+            delta = located - last_origin
+
+    contained = _fully_contained(canvas, frame, last_origin, located, top, bot)
+    if contained is not None and abs(delta) < MIN_GROW:
+        canvas, changed = refresh_viewport(canvas, frame, contained, top, bot)
+        return canvas, ("refresh" if changed else "none"), contained, 0
+
+    if dscore >= 1e8 and located is None:
+        edge_o, _edge_s, edge_d = _origin_from_canvas_edge(canvas, frame)
+        if edge_o is None:
+            canvas, changed = refresh_viewport(canvas, frame, last_origin, top, bot)
+            return canvas, ("refresh" if changed else "none"), last_origin, last_delta
+        origin, delta = edge_o, edge_d
+
+    if not _overlaps_canvas(canvas.shape[0], frame.shape[0], origin):
+        canvas, changed = refresh_viewport(canvas, frame, last_origin, top, bot)
+        return canvas, ("refresh" if changed else "none"), last_origin, last_delta
+
+    origin, delta = _refuse_duplicate_growth(canvas, frame, origin, last_origin, top, bot)
+
+    rendering = prev_frame is not None and looks_like_render(prev_frame, frame)
+    if rendering and abs(delta) < 8:
+        canvas, changed = refresh_viewport(canvas, frame, last_origin, top, bot)
+        return canvas, ("refresh" if changed else "none"), last_origin, last_delta
+    if abs(delta) < 2:
+        canvas, changed = refresh_viewport(canvas, frame, origin, top, bot)
+        return canvas, ("refresh" if changed else "none"), origin, 0
+
+    merged, direction, new_origin = place_frame(canvas, frame, origin, top, bot)
+    merged, refreshed = refresh_viewport(merged, frame, new_origin, top, bot)
+    if direction == "none" and refreshed:
+        direction = "refresh"
+    return merged, direction, new_origin, delta
 
 
 def focus_window_at(point: QPoint) -> None:
@@ -694,8 +984,15 @@ class ScrollCapturePanel(QWidget):
 
     def _tick_body(self) -> None:
         frame = grab_region_bgr(self._region)
-        if self._last is not None and frames_same(self._last, frame):
+        if self._last is not None and (frames_same(self._last, frame) or frames_idle(self._last, frame)):
             self._same_count += 1
+            if self._canvas is not None and self._same_count >= 3:
+                h2 = frame.shape[0]
+                at_bottom = self._frame_origin + h2 >= self._canvas.shape[0] - 2
+                at_top = self._frame_origin <= 2
+                if at_bottom or at_top:
+                    side = "底部" if at_bottom else "顶部"
+                    self.hint.setText(f"已到滚动{side}，继续翻不会再接图，可点「完成」")
             if self._auto:
                 if self._same_count >= 8:
                     self._auto = False
@@ -713,14 +1010,15 @@ class ScrollCapturePanel(QWidget):
         )
         if direction in {"up", "down"} and self._last_sharp > 20 and sharp < self._last_sharp * BLUR_RATIO:
             return
+        self._last = frame
+        self._same_count = 0
         grew = merged.shape[0] != self._canvas.shape[0]
         refreshed = direction == "refresh"
         if grew or refreshed or origin != self._frame_origin:
-            self._last = frame
             self._frame_origin = origin
-            self._last_delta = delta
+            if delta != 0:
+                self._last_delta = delta
             self._last_sharp = max(sharp, self._last_sharp * 0.85)
-            self._same_count = 0
         if merged.shape[0] > MAX_HEIGHT:
             self._canvas = merged[:MAX_HEIGHT] if direction != "down" else merged[-MAX_HEIGHT:]
             self._timer.stop()
