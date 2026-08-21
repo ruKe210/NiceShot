@@ -162,6 +162,7 @@ class CaptureOverlay(QWidget):
         self.close()
 
     def closeEvent(self, event) -> None:
+        self._clear_override_cursor()
         self._set_move_cursor(False)
         if QWidget.mouseGrabber() is self:
             self.releaseMouse()
@@ -240,16 +241,22 @@ class CaptureOverlay(QWidget):
         inner = self._selection.adjusted(HANDLE_HIT + 1, HANDLE_HIT + 1, -(HANDLE_HIT + 1), -(HANDLE_HIT + 1))
         return inner.contains(pos)
 
-    def _set_move_cursor(self, active: bool) -> None:
+    def _clear_override_cursor(self) -> None:
         app = QApplication.instance()
         if app is None:
             return
-        if active and not self._move_cursor:
-            app.setOverrideCursor(Qt.SizeAllCursor)
-            self._move_cursor = True
-        elif not active and self._move_cursor:
+        while app.overrideCursor() is not None:
             app.restoreOverrideCursor()
+        self._move_cursor = False
+
+    def _set_move_cursor(self, active: bool) -> None:
+        if active:
+            self.setCursor(Qt.SizeAllCursor)
+            self._move_cursor = True
+            return
+        if self._move_cursor:
             self._move_cursor = False
+            self.setCursor(Qt.ArrowCursor)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.RightButton:
@@ -679,7 +686,6 @@ class CaptureOverlay(QWidget):
             self.setCursor(Qt.CrossCursor)
             return
         if self._inside_move_area(pos) or (self._selection and self._selection.contains(pos)):
-            self.setCursor(Qt.SizeAllCursor)
             self._set_move_cursor(True)
             return
         self._set_move_cursor(False)
@@ -696,14 +702,9 @@ class CaptureOverlay(QWidget):
         th = metrics.height() + pad_y * 2
         x = rect.left()
         y = rect.top() - th - 2
-        bounds = self.rect()
-        if y < bounds.top():
+        if y < self.rect().top():
             y = rect.top() + 2
             x = rect.left() + 2
-        if x + tw > bounds.right():
-            x = max(bounds.left(), bounds.right() - tw)
-        if y + th > bounds.bottom():
-            y = max(bounds.top(), bounds.bottom() - th)
         box = QRect(x, y, tw, th)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(20, 20, 20, 210))
@@ -882,13 +883,15 @@ class CaptureOverlay(QWidget):
 
     def _on_worker_finished(self) -> None:
         self.toolbar.set_busy(False)
-        self.setCursor(Qt.CrossCursor)
+        self._clear_override_cursor()
+        self._apply_hover_cursor(self.mapFromGlobal(QCursor.pos()))
 
     def _show_ocr(self, text: object) -> None:
         content = str(text or "").strip()
         if not content:
             show_error(self, "未识别到文字")
             return
+        self._clear_override_cursor()
         dialog = ResultDialog("识别文字", content, parent=self)
         dialog.exec()
 
@@ -897,6 +900,7 @@ class CaptureOverlay(QWidget):
         if not str(text).strip():
             show_error(self, "未识别到文字")
             return
+        self._clear_override_cursor()
         dialog = ResultDialog("翻译", str(text), str(translated), parent=self)
         dialog.exec()
 
