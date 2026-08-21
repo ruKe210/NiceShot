@@ -57,5 +57,8 @@ def set_enabled(enabled: bool) -> None:
     shortcut.Arguments = f'"{script_path()}"'
     shortcut.WorkingDirectory = str(project_root())
     shortcut.Description = "NiceShot 截图工具"
+    icon = Path(__file__).resolve().parent / "assets" / "icon.png"
+    if icon.is_file():
+        shortcut.IconLocation = str(icon)
     shortcut.WindowStyle = 7
     shortcut.save()

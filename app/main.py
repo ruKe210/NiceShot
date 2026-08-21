@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+from pathlib import Path
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPen, QPixmap
@@ -39,7 +40,11 @@ def enable_dpi_aware() -> None:
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "0")
 
 
-def make_tray_icon() -> QIcon:
+def icon_file() -> Path:
+    return Path(__file__).resolve().parent / "assets" / "icon.png"
+
+
+def _drawn_icon() -> QIcon:
     pix = QPixmap(64, 64)
     pix.fill(Qt.transparent)
     painter = QPainter(pix)
@@ -54,6 +59,15 @@ def make_tray_icon() -> QIcon:
     painter.drawLine(48, 20, 32, 12)
     painter.end()
     return QIcon(pix)
+
+
+def make_tray_icon() -> QIcon:
+    path = icon_file()
+    if path.is_file():
+        icon = QIcon(str(path))
+        if not icon.isNull():
+            return icon
+    return _drawn_icon()
 
 
 class HotkeyDialog(QDialog):
@@ -223,6 +237,7 @@ def main() -> None:
 
     qt_app = QApplication(sys.argv)
     qt_app.setApplicationName("NiceShot")
+    qt_app.setWindowIcon(make_tray_icon())
     if not QSystemTrayIcon.isSystemTrayAvailable():
         QMessageBox.critical(None, "NiceShot", "系统托盘不可用，无法常驻运行。")
         sys.exit(1)
