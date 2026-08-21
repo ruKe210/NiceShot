@@ -21,7 +21,6 @@ class Magnifier(QWidget):
         self._pixmap = QPixmap()
         self._image = None
         self._cursor = QPoint(0, 0)
-        self._sel_size: tuple[int, int] | None = None
         self._mode = MODE_HEX
         self._copied = False
         self._copied_code = ""
@@ -30,9 +29,8 @@ class Magnifier(QWidget):
         self._pixmap = pixmap
         self._image = pixmap.toImage() if not pixmap.isNull() else None
 
-    def update_at(self, pos: QPoint, sel_size: tuple[int, int] | None = None) -> None:
+    def update_at(self, pos: QPoint) -> None:
         self._cursor = pos
-        self._sel_size = sel_size
         if self._copied and self.color_code() != self._copied_code:
             self._copied = False
             self._copied_code = ""
@@ -112,8 +110,6 @@ class Magnifier(QWidget):
         lines = [f"{cx}, {cy}  {code}"]
         if self._copied:
             lines.append("已复制")
-        elif self._sel_size:
-            lines.append(f"{self._sel_size[0]} × {self._sel_size[1]}  {mode_name}")
         else:
             lines.append(f"{mode_name}  Shift切换  Ctrl+C复制")
         painter.drawText(
