@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication, QWidget
 from app.clipboard_win import copy_image
 from app.magnifier import Magnifier
 from app.ocr_engine import recognize
+from app.pin_window import PinWindow
 from app.result_dialog import ResultDialog, show_error
 from app.scroll_capture import ScrollCapturePanel, exclude_from_capture, wheel_at
 from app.toolbar import CaptureToolbar
@@ -88,6 +89,7 @@ class Worker(QThread):
 class CaptureOverlay(QWidget):
     closed = Signal()
     copied = Signal()
+    pin_requested = Signal(object)
 
     def __init__(
         self,
@@ -140,6 +142,7 @@ class CaptureOverlay(QWidget):
         self.magnifier.set_source(screenshot)
         self.toolbar = CaptureToolbar(self)
         self.toolbar.hide()
+        self.toolbar.pin_clicked.connect(self._on_pin)
         self.toolbar.ocr_clicked.connect(self._on_ocr)
         self.toolbar.translate_clicked.connect(self._on_translate)
         self.toolbar.scroll_clicked.connect(self._on_scroll)
@@ -786,7 +789,7 @@ class CaptureOverlay(QWidget):
             else:
                 painter.drawRect(rect.adjusted(0, 0, -1, -1))
 
-    def _crop(self) -> Image.Image | None:
+    def _crop_pixmap(self) -> QPixmap | None:
         if not self._selection:
             return None
         pix = self._shot.copy(self._selection)
@@ -795,7 +798,26 @@ class CaptureOverlay(QWidget):
             painter.setClipRect(QRect(0, 0, pix.width(), pix.height()))
             self._draw_annotations(painter, self._selection.topLeft(), include_draft=False)
             painter.end()
+        return pix
+
+    def _crop(self) -> Image.Image | None:
+        pix = self._crop_pixmap()
+        if pix is None:
+            return None
         return pixmap_to_pil(pix)
+
+    def _on_pin(self) -> None:
+        pix = self._crop_pixmap()
+        if pix is None or not self._selection:
+            return
+        geo = QRect(
+            self._selection.x() + self._origin.x(),
+            self._selection.y() + self._origin.y(),
+            self._selection.width(),
+            self._selection.height(),
+        )
+        self.pin_requested.emit(PinWindow(pix, geo))
+        self.close()
 
     def _on_scroll(self) -> None:
         if not self._selection:

@@ -25,6 +25,7 @@ from app.autostart import set_enabled as set_autostart
 from app.config import DEFAULT_DISABLE_HOTKEY, DEFAULT_HOTKEY, load_config, save_config
 from app.hotkey import GlobalHotkey, format_key_event
 from app.overlay import CaptureOverlay, grab_virtual_desktop
+from app.pin_window import PinWindow
 from app.window_detect import enum_windows
 
 _SINGLE_MUTEX_NAME = "Local\\NiceShot.Screenshot"
@@ -147,6 +148,7 @@ class NiceShotApp:
         self.app.setQuitOnLastWindowClosed(False)
         self.config = load_config()
         self._overlay: CaptureOverlay | None = None
+        self._pins: list[PinWindow] = []
 
         self.host = QWidget()
         self.host.setWindowTitle("NiceShotHost")
@@ -280,6 +282,7 @@ class NiceShotApp:
         overlay = CaptureOverlay(screenshot, origin, windows)
         overlay.closed.connect(self._on_overlay_closed)
         overlay.copied.connect(self._on_copied)
+        overlay.pin_requested.connect(self._on_pin_requested)
         self._overlay = overlay
         overlay.show()
         overlay.activateWindow()
@@ -287,6 +290,18 @@ class NiceShotApp:
 
     def _on_overlay_closed(self) -> None:
         self._overlay = None
+
+    def _on_pin_requested(self, pin: object) -> None:
+        if not isinstance(pin, PinWindow):
+            return
+        pin.closed.connect(self._on_pin_closed)
+        self._pins.append(pin)
+        pin.show()
+        pin.raise_()
+
+    def _on_pin_closed(self, pin: object) -> None:
+        if pin in self._pins:
+            self._pins.remove(pin)
 
     def _on_copied(self) -> None:
         self.tray.showMessage("NiceShot", "已复制到剪贴板，可粘贴到文件夹或其它程序", QSystemTrayIcon.Information, 2000)
@@ -350,6 +365,8 @@ class NiceShotApp:
         self.disable_hotkey.unregister()
         if self._overlay is not None:
             self._overlay.close()
+        for pin in list(self._pins):
+            pin.close()
         self.tray.hide()
         self.app.quit()
 

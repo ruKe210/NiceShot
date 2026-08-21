@@ -185,6 +185,7 @@ class StyleBar(QWidget):
 
 
 class CaptureToolbar(QWidget):
+    pin_clicked = Signal()
     ocr_clicked = Signal()
     translate_clicked = Signal()
     scroll_clicked = Signal()
@@ -245,6 +246,8 @@ class CaptureToolbar(QWidget):
 
         self.rect_btn = ShapeToolButton("rect", "画矩形框")
         self.ellipse_btn = ShapeToolButton("ellipse", "画圆形框")
+        self.pin_btn = self._text_btn("固定到屏幕", font)
+        self.pin_btn.setToolTip("把当前截图钉在屏幕上；可拖动、横竖拉伸、滚轮缩放，右键复制")
         self.ocr_btn = self._text_btn("识别文字", font)
         self.ocr_btn.setToolTip("识别选区内的中英文")
         self.translate_btn = self._text_btn("翻译", font)
@@ -258,6 +261,7 @@ class CaptureToolbar(QWidget):
         self.cancel_btn = CancelButton()
         self.confirm_btn = ConfirmButton()
 
+        self.pin_btn.clicked.connect(self.pin_clicked.emit)
         self.ocr_btn.clicked.connect(self.ocr_clicked.emit)
         self.translate_btn.clicked.connect(self.translate_clicked.emit)
         self.scroll_btn.clicked.connect(self.scroll_clicked.emit)
@@ -270,6 +274,7 @@ class CaptureToolbar(QWidget):
 
         row.addWidget(self.rect_btn)
         row.addWidget(self.ellipse_btn)
+        row.addWidget(self.pin_btn)
         row.addWidget(self.ocr_btn)
         row.addWidget(self.translate_btn)
         row.addWidget(self.scroll_btn)
@@ -325,6 +330,7 @@ class CaptureToolbar(QWidget):
 
     def set_busy(self, busy: bool) -> None:
         for btn in (
+            self.pin_btn,
             self.ocr_btn,
             self.translate_btn,
             self.scroll_btn,
