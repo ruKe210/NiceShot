@@ -194,10 +194,14 @@ class CaptureToolbar(QWidget):
     color_changed = Signal(QColor)
     width_changed = Signal(int)
     undo_clicked = Signal()
+    redo_clicked = Signal()
+    pointer_entered = Signal()
+    pointer_left = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setMouseTracking(True)
         self.setStyleSheet(
             """
             CaptureToolbar {
@@ -239,8 +243,8 @@ class CaptureToolbar(QWidget):
         font = QFont()
         font.setPixelSize(13)
 
-        self.rect_btn = ShapeToolButton("rect", "画矩形框：在选区内拖拽，用来圈出要强调的内容。画完后还可再拖边角调整。")
-        self.ellipse_btn = ShapeToolButton("ellipse", "画圆形框：在选区内拖拽，用来圈出要强调的内容。画完后还可再拖边角调整。")
+        self.rect_btn = ShapeToolButton("rect", "画矩形框")
+        self.ellipse_btn = ShapeToolButton("ellipse", "画圆形框")
         self.ocr_btn = self._text_btn("识别文字", font)
         self.ocr_btn.setToolTip("识别选区内的中英文")
         self.translate_btn = self._text_btn("翻译", font)
@@ -248,7 +252,9 @@ class CaptureToolbar(QWidget):
         self.scroll_btn = self._text_btn("滚动截图", font)
         self.scroll_btn.setToolTip("在窗口内滚动，拼接成长图")
         self.undo_btn = self._text_btn("撤销", font)
-        self.undo_btn.setToolTip("撤销上一笔标注")
+        self.undo_btn.setToolTip("撤销上一笔标注（Ctrl+Z）")
+        self.redo_btn = self._text_btn("前进", font)
+        self.redo_btn.setToolTip("恢复撤销的标注（Ctrl+Y）")
         self.cancel_btn = CancelButton()
         self.confirm_btn = ConfirmButton()
 
@@ -258,6 +264,7 @@ class CaptureToolbar(QWidget):
         self.rect_btn.clicked.connect(self._on_rect_tool)
         self.ellipse_btn.clicked.connect(self._on_ellipse_tool)
         self.undo_btn.clicked.connect(self.undo_clicked.emit)
+        self.redo_btn.clicked.connect(self.redo_clicked.emit)
         self.cancel_btn.clicked.connect(self.cancel_requested.emit)
         self.confirm_btn.clicked.connect(self.confirm_clicked.emit)
 
@@ -267,6 +274,7 @@ class CaptureToolbar(QWidget):
         row.addWidget(self.translate_btn)
         row.addWidget(self.scroll_btn)
         row.addWidget(self.undo_btn)
+        row.addWidget(self.redo_btn)
         row.addWidget(self.cancel_btn)
         row.addWidget(self.confirm_btn)
         root.addLayout(row)
@@ -323,12 +331,24 @@ class CaptureToolbar(QWidget):
             self.rect_btn,
             self.ellipse_btn,
             self.undo_btn,
+            self.redo_btn,
             self.cancel_btn,
             self.confirm_btn,
         ):
             btn.setEnabled(not busy)
         self.style_bar.setEnabled(not busy)
         self.ocr_btn.setText("处理中…" if busy else "识别文字")
+
+    def enterEvent(self, event) -> None:
+        self.pointer_entered.emit()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        from PySide6.QtGui import QCursor
+
+        if not self.rect().contains(self.mapFromGlobal(QCursor.pos())):
+            self.pointer_left.emit()
+        super().leaveEvent(event)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.RightButton:

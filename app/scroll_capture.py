@@ -21,6 +21,14 @@ PREVIEW_MIN_WIDTH = 64
 MAX_HEIGHT = 32000
 SIDE_MARGIN = 16
 MIN_BAND = 24
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
+
+
+def exclude_from_capture(widget: QWidget) -> None:
+    try:
+        ctypes.windll.user32.SetWindowDisplayAffinity(int(widget.winId()), WDA_EXCLUDEFROMCAPTURE)
+    except Exception:
+        pass
 
 
 def grab_region(rect: QRect) -> Image.Image:
@@ -151,25 +159,41 @@ def stitch_vertical(
     frame: np.ndarray,
     prev_frame: np.ndarray | None = None,
 ) -> tuple[np.ndarray, str]:
-    """按滚动方向把新区域接到长图上：下滚接下，上滚接上。"""
+    """只拼接超出已记录顶/底边界的新内容，在已覆盖范围内来回滚不重复加长。"""
+    del prev_frame
     if canvas.shape[1] != frame.shape[1]:
         frame = cv2.resize(frame, (canvas.shape[1], frame.shape[0]), interpolation=cv2.INTER_AREA)
-    prev = prev_frame if prev_frame is not None else (
-        canvas[-frame.shape[0] :] if canvas.shape[0] >= frame.shape[0] else canvas
-    )
-    if prev.shape[1] != frame.shape[1]:
-        prev = cv2.resize(prev, (frame.shape[1], prev.shape[0]), interpolation=cv2.INTER_AREA)
+    if frames_same(canvas[: frame.shape[0]], frame) if canvas.shape[0] >= frame.shape[0] else False:
+        return canvas, "none"
+    if canvas.shape[0] >= frame.shape[0] and frames_same(canvas[-frame.shape[0] :], frame):
+        return canvas, "none"
 
-    direction, extra = detect_scroll(prev, frame)
-    if direction == "none" or extra is None or extra.shape[0] == 0:
-        return canvas, "none"
-    if extra.shape[1] != canvas.shape[1]:
-        extra = cv2.resize(extra, (canvas.shape[1], extra.shape[0]), interpolation=cv2.INTER_AREA)
-    if _already_filled(canvas, extra, direction):
-        return canvas, "none"
-    if direction == "up":
-        return np.vstack([extra, canvas]), "up"
-    return np.vstack([canvas, extra]), "down"
+    left, right = _content_x(canvas.shape[1])
+    h1, h2 = canvas.shape[0], frame.shape[0]
+    extra_up = extra_down = None
+    for band in (120, 80, 48, MIN_BAND):
+        if h1 < band or h2 < band:
+            continue
+        search = frame[:, left:right]
+        y_bot = _verified_y(search, canvas[-band:, left:right])
+        if y_bot is not None:
+            start = y_bot + band
+            if start < h2:
+                extra_down = frame[start:]
+        y_top = _verified_y(search, canvas[:band, left:right])
+        if y_top is not None and y_top > 0:
+            extra_up = frame[:y_top]
+        if extra_down is not None or extra_up is not None:
+            break
+
+    direction = "none"
+    if extra_down is not None and extra_down.shape[0] > 0 and not _already_filled(canvas, extra_down, "down"):
+        canvas = np.vstack([canvas, extra_down])
+        direction = "down"
+    if extra_up is not None and extra_up.shape[0] > 0 and not _already_filled(canvas, extra_up, "up"):
+        canvas = np.vstack([extra_up, canvas])
+        direction = "up" if direction == "none" else direction
+    return canvas, direction
 
 
 def focus_window_at(point: QPoint) -> None:
@@ -206,8 +230,13 @@ class ScrollPreview(QWidget):
         self._label = QLabel(self)
         self._label.setAlignment(Qt.AlignCenter)
         self._pad = 6
+        self._avoid = QRect()
 
-    def set_canvas(self, canvas: np.ndarray, screen: QRect) -> None:
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        exclude_from_capture(self)
+
+    def set_canvas(self, canvas: np.ndarray, screen: QRect, avoid: QRect | None = None) -> None:
         h, w = canvas.shape[:2]
         if w < 1 or h < 1:
             return
@@ -226,9 +255,24 @@ class ScrollPreview(QWidget):
         self._label.setPixmap(pix)
         self._label.setGeometry(self._pad, self._pad, pw, ph)
         self.resize(pw + self._pad * 2, ph + self._pad * 2)
-        x = screen.right() - self.width() - PREVIEW_MARGIN
-        y = screen.bottom() - self.height() - PREVIEW_MARGIN
-        self.move(x, y)
+        if avoid is not None:
+            self._avoid = QRect(avoid)
+        box = self.size()
+        margin = PREVIEW_MARGIN
+        candidates = [
+            QPoint(screen.right() - box.width() - margin, screen.bottom() - box.height() - margin),
+            QPoint(screen.right() - box.width() - margin, screen.top() + margin),
+            QPoint(screen.left() + margin, screen.bottom() - box.height() - margin),
+            QPoint(screen.left() + margin, screen.top() + margin),
+        ]
+        placed = False
+        for pos in candidates:
+            if not QRect(pos, box).intersects(self._avoid):
+                self.move(pos)
+                placed = True
+                break
+        if not placed:
+            self.move(candidates[0])
         self.show()
         self.raise_()
 
@@ -282,7 +326,7 @@ class ScrollCapturePanel(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(8)
-        self.hint = QLabel("请在选区内滚动，画面会自动拼接")
+        self.hint = QLabel("在挖空选区内滚动，仅拼接超出已截范围的新内容")
         font = QFont()
         font.setPixelSize(13)
         self.hint.setFont(font)
@@ -306,6 +350,10 @@ class ScrollCapturePanel(QWidget):
         self._timer = QTimer(self)
         self._timer.setInterval(380)
         self._timer.timeout.connect(self._tick)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        exclude_from_capture(self)
 
     def start(self) -> None:
         self.show()
@@ -357,17 +405,7 @@ class ScrollCapturePanel(QWidget):
     def _tick(self) -> None:
         if self._busy or self._canvas is None:
             return
-        preview_overlap = self._preview.isVisible() and QRect(
-            self._preview.pos(), self._preview.size()
-        ).intersects(self._region)
-        if self._overlap or preview_overlap:
-            self.hide()
-            self._preview.hide()
-            QGuiApplication.processEvents()
         frame = _to_bgr(grab_region(self._region))
-        if self._overlap or preview_overlap:
-            self.show()
-            self._preview.show()
         if self._last is not None and frames_same(self._last, frame):
             self._same_count += 1
             if self._auto:
@@ -404,7 +442,7 @@ class ScrollCapturePanel(QWidget):
     def _refresh_preview(self) -> None:
         if self._canvas is None:
             return
-        self._preview.set_canvas(self._canvas, self._preview_screen())
+        self._preview.set_canvas(self._canvas, self._preview_screen(), self._region)
 
     def _update_hint(self, direction: str = "none") -> None:
         if self._canvas is None:

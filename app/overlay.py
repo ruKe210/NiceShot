@@ -6,14 +6,14 @@ from io import BytesIO
 import mss
 from PIL import Image
 from PySide6.QtCore import QPoint, QRect, Qt, QThread, Signal
-from PySide6.QtGui import QColor, QCursor, QGuiApplication, QImage, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QCursor, QGuiApplication, QImage, QPainter, QPen, QPixmap, QRegion
 from PySide6.QtWidgets import QWidget
 
 from app.clipboard_win import copy_image
 from app.magnifier import Magnifier
 from app.ocr_engine import recognize
 from app.result_dialog import ResultDialog, show_error
-from app.scroll_capture import ScrollCapturePanel
+from app.scroll_capture import ScrollCapturePanel, exclude_from_capture, wheel_at
 from app.toolbar import CaptureToolbar
 from app.translator import translate
 from app.window_detect import OVERLAY_TITLE, hit_test
@@ -106,10 +106,12 @@ class CaptureOverlay(QWidget):
         self._finalized = False
         self._worker: Worker | None = None
         self._scroll: ScrollCapturePanel | None = None
+        self._scrolling = False
         self._tool = ""
         self._pen_color = QColor("#E85454")
         self._pen_width = 4
         self._annots: list[Annotation] = []
+        self._redo: list[Annotation] = []
         self._draw_start: QPoint | None = None
         self._draft: QRect | None = None
         self._resize_handle: str | None = None
@@ -139,8 +141,10 @@ class CaptureOverlay(QWidget):
         self.toolbar.color_changed.connect(self._on_color_changed)
         self.toolbar.width_changed.connect(self._on_width_changed)
         self.toolbar.undo_clicked.connect(self._undo_annot)
+        self.toolbar.redo_clicked.connect(self._redo_annot)
         self.toolbar.confirm_clicked.connect(self._on_confirm)
         self.toolbar.cancel_requested.connect(self.cancel)
+        self.toolbar.pointer_entered.connect(self.magnifier.hide)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -164,11 +168,16 @@ class CaptureOverlay(QWidget):
         if event.key() == Qt.Key_Escape:
             self.cancel()
             return
+        if self._scrolling:
+            return
         if event.key() in (Qt.Key_Return, Qt.Key_Enter) and self._selection:
             self._on_confirm()
             return
         if event.key() == Qt.Key_Z and event.modifiers() & Qt.ControlModifier:
             self._undo_annot()
+            return
+        if event.key() == Qt.Key_Y and event.modifiers() & Qt.ControlModifier:
+            self._redo_annot()
             return
         if event.key() == Qt.Key_C and event.modifiers() & Qt.ControlModifier:
             self._copy_color()
@@ -181,6 +190,8 @@ class CaptureOverlay(QWidget):
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.RightButton:
             self.cancel()
+            return
+        if self._scrolling:
             return
         if event.button() != Qt.LeftButton:
             return
@@ -214,7 +225,18 @@ class CaptureOverlay(QWidget):
         if self._hover is None:
             self._hover = self._window_or_monitor_at(self._press)
 
+    def wheelEvent(self, event) -> None:
+        if self._scrolling and self._selection:
+            steps = -3 if event.angleDelta().y() < 0 else 3
+            if event.angleDelta().y() != 0:
+                wheel_at(self._selection.center() + self._origin, steps)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
     def mouseMoveEvent(self, event) -> None:
+        if self._scrolling:
+            return
         pos = event.pos()
         if self._finalized and self._resize_handle and self._resize_origin:
             self._selection = self._resize_rect(self._resize_handle, pos, self._resize_origin)
@@ -263,6 +285,8 @@ class CaptureOverlay(QWidget):
     def mouseReleaseEvent(self, event) -> None:
         if event.button() != Qt.LeftButton:
             return
+        if self._scrolling:
+            return
         if self._finalized:
             if self._resize_handle:
                 self._resize_handle = None
@@ -272,6 +296,9 @@ class CaptureOverlay(QWidget):
                 self.update()
                 return
             if self._annot_resize_handle:
+                if self._annot_resize_origin is not None and 0 <= self._active_annot < len(self._annots):
+                    if self._annots[self._active_annot].rect != self._annot_resize_origin:
+                        self._redo.clear()
                 self._annot_resize_handle = None
                 self._annot_resize_origin = None
                 self._update_magnifier(event.pos(), None)
@@ -287,6 +314,7 @@ class CaptureOverlay(QWidget):
                     )
                 )
                 self._active_annot = len(self._annots) - 1
+                self._redo.clear()
             self._draw_start = None
             self._draft = None
             self._update_magnifier(event.pos(), None)
@@ -367,12 +395,18 @@ class CaptureOverlay(QWidget):
         QApplication.clipboard().setText(self.magnifier.color_code())
         self.magnifier.mark_copied()
 
+    def _over_toolbar(self, pos: QPoint) -> bool:
+        if not self.toolbar.isVisible():
+            return False
+        return self.toolbar.geometry().adjusted(-6, -6, 6, 6).contains(pos)
+
     def _update_magnifier(self, pos: QPoint, sel_size: tuple[int, int] | None) -> None:
-        if self._draw_start is not None:
+        if self._scrolling or self._draw_start is not None or self._over_toolbar(pos):
             self.magnifier.hide()
             return
         self.magnifier.show()
         self.magnifier.raise_()
+        self.toolbar.raise_()
         self.magnifier.update_at(pos, sel_size)
         self.magnifier.place_near(pos, self.rect())
 
@@ -482,20 +516,29 @@ class CaptureOverlay(QWidget):
         self._pen_color = QColor(color)
         if 0 <= self._active_annot < len(self._annots):
             self._annots[self._active_annot].color = QColor(color)
+            self._redo.clear()
             self.update()
 
     def _on_width_changed(self, width: int) -> None:
         self._pen_width = int(width)
         if 0 <= self._active_annot < len(self._annots):
             self._annots[self._active_annot].width = int(width)
+            self._redo.clear()
             self.update()
 
     def _undo_annot(self) -> None:
-        if self._annots:
-            self._annots.pop()
-            if self._active_annot >= len(self._annots):
-                self._active_annot = len(self._annots) - 1
-            self.update()
+        if not self._annots:
+            return
+        self._redo.append(self._annots.pop())
+        self._active_annot = len(self._annots) - 1
+        self.update()
+
+    def _redo_annot(self) -> None:
+        if not self._redo:
+            return
+        self._annots.append(self._redo.pop())
+        self._active_annot = len(self._annots) - 1
+        self.update()
 
     def _draw_annotations(
         self,
@@ -542,11 +585,20 @@ class CaptureOverlay(QWidget):
             self._selection.width(),
             self._selection.height(),
         )
-        self.hide()
+        self._scrolling = True
+        self.toolbar.hide()
+        self.magnifier.hide()
+        hole = QRect(self._selection).adjusted(2, 2, -2, -2)
+        mask = QRegion(self.rect())
+        if hole.isValid() and hole.width() > 4 and hole.height() > 4:
+            mask = mask.subtracted(QRegion(hole))
+        self.setMask(mask)
+        exclude_from_capture(self)
         self._scroll = ScrollCapturePanel(region)
         self._scroll.finished.connect(self._on_scroll_done)
         self._scroll.cancelled.connect(self.cancel)
         self._scroll.start()
+        self.update()
 
     def _on_scroll_done(self, image: object) -> None:
         if not isinstance(image, Image.Image):
@@ -628,6 +680,12 @@ class CaptureOverlay(QWidget):
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
+        if self._scrolling and self._selection:
+            painter.fillRect(self.rect(), DIM)
+            painter.setPen(QPen(ACCENT, 2))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(self._selection.adjusted(0, 0, -1, -1))
+            return
         painter.drawPixmap(0, 0, self._shot)
         painter.fillRect(self.rect(), DIM)
 
