@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (
     QColorDialog,
     QHBoxLayout,
     QPushButton,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -57,6 +58,38 @@ class ConfirmButton(CircleIconButton):
         painter.drawLine(16, 25, 26, 13)
 
 
+class ShapeToolButton(QPushButton):
+    def __init__(self, kind: str, tooltip: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.kind = kind
+        self.setFixedSize(36, 36)
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(tooltip)
+        self.setToolTipDuration(5000)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        hovered = self.underMouse()
+        checked = self.isChecked()
+        if checked:
+            bg = QColor(51, 112, 255, 90)
+        elif hovered:
+            bg = QColor(255, 255, 255, 28)
+        else:
+            bg = QColor(0, 0, 0, 0)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(bg)
+        painter.drawRoundedRect(2, 2, 32, 32, 6, 6)
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(242, 242, 242), 2))
+        if self.kind == "rect":
+            painter.drawRect(9, 11, 18, 14)
+        else:
+            painter.drawEllipse(9, 9, 18, 18)
+
+
 class ColorDot(QPushButton):
     def __init__(self, color: QColor, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -64,7 +97,8 @@ class ColorDot(QPushButton):
         self.setFixedSize(18, 18)
         self.setCursor(Qt.PointingHandCursor)
         self.setCheckable(True)
-        self.setToolTip(color.name())
+        self.setToolTip(f"边框颜色 {color.name().upper()}")
+        self.setToolTipDuration(4000)
         self._apply()
 
     def _apply(self) -> None:
@@ -82,6 +116,74 @@ class ColorDot(QPushButton):
         self._apply()
 
 
+class StyleBar(QWidget):
+    color_changed = Signal(QColor)
+    width_changed = Signal(int)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._color = QColor("#E85454")
+        self._width = 4
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 2, 8, 6)
+        layout.setSpacing(6)
+        self.color_dots: list[ColorDot] = []
+        self.width_btns: list[QPushButton] = []
+        for color in PRESET_COLORS:
+            dot = ColorDot(color)
+            dot.clicked.connect(lambda checked=False, c=color: self.set_color(c))
+            self.color_dots.append(dot)
+            layout.addWidget(dot)
+        more = QPushButton("+")
+        more.setObjectName("widthBtn")
+        more.setFixedSize(18, 18)
+        more.setCursor(Qt.PointingHandCursor)
+        more.setToolTip("自定义边框颜色")
+        more.setToolTipDuration(4000)
+        more.clicked.connect(self._pick_color)
+        layout.addWidget(more)
+        for width in PRESET_WIDTHS:
+            btn = QPushButton(str(width))
+            btn.setObjectName("widthBtn")
+            btn.setCheckable(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setToolTip(f"边框粗细 {width} 像素")
+            btn.setToolTipDuration(4000)
+            btn.clicked.connect(lambda checked=False, w=width: self.set_width(w))
+            self.width_btns.append(btn)
+            layout.addWidget(btn)
+        layout.addStretch()
+        self._sync()
+
+    def set_color(self, color: QColor) -> None:
+        self._color = QColor(color)
+        self._sync()
+        self.color_changed.emit(self._color)
+
+    def set_width(self, width: int) -> None:
+        self._width = width
+        self._sync()
+        self.width_changed.emit(width)
+
+    def _pick_color(self) -> None:
+        color = QColorDialog.getColor(self._color, self, "选择边框颜色")
+        if color.isValid():
+            self.set_color(color)
+
+    def _sync(self) -> None:
+        for dot in self.color_dots:
+            dot.setChecked(dot.color.name().lower() == self._color.name().lower())
+        for btn, width in zip(self.width_btns, PRESET_WIDTHS):
+            btn.setChecked(width == self._width)
+
+    def current_color(self) -> QColor:
+        return QColor(self._color)
+
+    def current_width(self) -> int:
+        return self._width
+
+
 class CaptureToolbar(QWidget):
     ocr_clicked = Signal()
     translate_clicked = Signal()
@@ -95,10 +197,7 @@ class CaptureToolbar(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setFixedHeight(48)
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self._color = QColor("#E85454")
-        self._width = 4
         self.setStyleSheet(
             """
             CaptureToolbar {
@@ -116,10 +215,6 @@ class CaptureToolbar(QWidget):
                 background: rgba(255, 255, 255, 28);
                 border-radius: 6px;
             }
-            QPushButton#textBtn:checked {
-                background: rgba(51, 112, 255, 90);
-                border-radius: 6px;
-            }
             QPushButton#textBtn:disabled { color: #888; }
             QPushButton#widthBtn {
                 color: #f2f2f2;
@@ -134,18 +229,24 @@ class CaptureToolbar(QWidget):
             }
             """
         )
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(4)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(4, 4, 4, 4)
+        root.setSpacing(0)
 
+        row = QHBoxLayout()
+        row.setContentsMargins(4, 2, 4, 2)
+        row.setSpacing(4)
         font = QFont()
         font.setPixelSize(13)
+
+        self.rect_btn = ShapeToolButton("rect", "画矩形框：在选区内拖拽，用来圈出要强调的内容。画完后还可再拖边角调整。")
+        self.ellipse_btn = ShapeToolButton("ellipse", "画圆形框：在选区内拖拽，用来圈出要强调的内容。画完后还可再拖边角调整。")
         self.ocr_btn = self._text_btn("识别文字", font)
+        self.ocr_btn.setToolTip("识别选区内的中英文")
         self.translate_btn = self._text_btn("翻译", font)
+        self.translate_btn.setToolTip("识别选区文字并中英互译")
         self.scroll_btn = self._text_btn("滚动截图", font)
         self.scroll_btn.setToolTip("在窗口内滚动，拼接成长图")
-        self.rect_btn = self._text_btn("矩形", font, checkable=True)
-        self.ellipse_btn = self._text_btn("圆形", font, checkable=True)
         self.undo_btn = self._text_btn("撤销", font)
         self.undo_btn.setToolTip("撤销上一笔标注")
         self.cancel_btn = CancelButton()
@@ -160,54 +261,29 @@ class CaptureToolbar(QWidget):
         self.cancel_btn.clicked.connect(self.cancel_requested.emit)
         self.confirm_btn.clicked.connect(self.confirm_clicked.emit)
 
-        self.color_dots: list[ColorDot] = []
-        self.width_btns: list[QPushButton] = []
+        row.addWidget(self.rect_btn)
+        row.addWidget(self.ellipse_btn)
+        row.addWidget(self.ocr_btn)
+        row.addWidget(self.translate_btn)
+        row.addWidget(self.scroll_btn)
+        row.addWidget(self.undo_btn)
+        row.addWidget(self.cancel_btn)
+        row.addWidget(self.confirm_btn)
+        root.addLayout(row)
 
-        layout.addWidget(self.ocr_btn)
-        layout.addWidget(self.translate_btn)
-        layout.addWidget(self.scroll_btn)
-        layout.addWidget(self.rect_btn)
-        layout.addWidget(self.ellipse_btn)
-
-        self._style_widgets: list[QWidget] = []
-        for color in PRESET_COLORS:
-            dot = ColorDot(color)
-            dot.clicked.connect(lambda checked=False, c=color: self._set_color(c))
-            self.color_dots.append(dot)
-            self._style_widgets.append(dot)
-            layout.addWidget(dot)
-        more = QPushButton("+")
-        more.setObjectName("widthBtn")
-        more.setFixedSize(18, 18)
-        more.setCursor(Qt.PointingHandCursor)
-        more.setToolTip("自定义颜色")
-        more.clicked.connect(self._pick_color)
-        self._style_widgets.append(more)
-        layout.addWidget(more)
-        for width in PRESET_WIDTHS:
-            btn = QPushButton(str(width))
-            btn.setObjectName("widthBtn")
-            btn.setCheckable(True)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setToolTip(f"边框粗细 {width}px")
-            btn.clicked.connect(lambda checked=False, w=width: self._set_width(w))
-            self.width_btns.append(btn)
-            self._style_widgets.append(btn)
-            layout.addWidget(btn)
-
-        layout.addWidget(self.undo_btn)
-        layout.addWidget(self.cancel_btn)
-        layout.addWidget(self.confirm_btn)
-        self._sync_style()
-        self._set_style_visible(False)
+        self.style_bar = StyleBar()
+        self.style_bar.color_changed.connect(self.color_changed.emit)
+        self.style_bar.width_changed.connect(self.width_changed.emit)
+        self.style_bar.hide()
+        root.addWidget(self.style_bar)
         self.adjustSize()
 
-    def _text_btn(self, text: str, font: QFont, checkable: bool = False) -> QPushButton:
+    def _text_btn(self, text: str, font: QFont) -> QPushButton:
         btn = QPushButton(text)
         btn.setObjectName("textBtn")
         btn.setFont(font)
         btn.setCursor(Qt.PointingHandCursor)
-        btn.setCheckable(checkable)
+        btn.setToolTipDuration(4000)
         return btn
 
     def _on_rect_tool(self) -> None:
@@ -225,43 +301,19 @@ class CaptureToolbar(QWidget):
             self._apply_tool("")
 
     def _apply_tool(self, tool: str) -> None:
-        self._set_style_visible(bool(tool))
+        self.style_bar.setVisible(bool(tool))
         self.adjustSize()
         self.tool_changed.emit(tool)
 
-    def _set_style_visible(self, visible: bool) -> None:
-        for widget in self._style_widgets:
-            widget.setVisible(visible)
-
-    def _set_color(self, color: QColor) -> None:
-        self._color = QColor(color)
-        self._sync_style()
-        self.color_changed.emit(self._color)
-
-    def _set_width(self, width: int) -> None:
-        self._width = width
-        self._sync_style()
-        self.width_changed.emit(width)
-
-    def _pick_color(self) -> None:
-        color = QColorDialog.getColor(self._color, self, "选择边框颜色")
-        if color.isValid():
-            self._set_color(color)
-
-    def _sync_style(self) -> None:
-        for dot in self.color_dots:
-            dot.setChecked(dot.color.name().lower() == self._color.name().lower())
-        for btn, width in zip(self.width_btns, PRESET_WIDTHS):
-            btn.setChecked(width == self._width)
-
     def current_color(self) -> QColor:
-        return QColor(self._color)
+        return self.style_bar.current_color()
 
     def current_width(self) -> int:
-        return self._width
+        return self.style_bar.current_width()
 
     def sizeHint(self) -> QSize:
-        return QSize(max(self.minimumSizeHint().width(), 200), 48)
+        extra = 34 if self.style_bar.isVisible() else 0
+        return QSize(max(self.minimumSizeHint().width(), 280), 48 + extra)
 
     def set_busy(self, busy: bool) -> None:
         for btn in (
@@ -275,8 +327,7 @@ class CaptureToolbar(QWidget):
             self.confirm_btn,
         ):
             btn.setEnabled(not busy)
-        for widget in self._style_widgets:
-            widget.setEnabled(not busy)
+        self.style_bar.setEnabled(not busy)
         self.ocr_btn.setText("处理中…" if busy else "识别文字")
 
     def mousePressEvent(self, event) -> None:

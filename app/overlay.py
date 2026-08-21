@@ -114,6 +114,9 @@ class CaptureOverlay(QWidget):
         self._draft: QRect | None = None
         self._resize_handle: str | None = None
         self._resize_origin: QRect | None = None
+        self._active_annot = -1
+        self._annot_resize_handle: str | None = None
+        self._annot_resize_origin: QRect | None = None
 
         self.setWindowTitle(OVERLAY_TITLE)
         self.setWindowFlags(
@@ -187,6 +190,16 @@ class CaptureOverlay(QWidget):
                 self._resize_handle = handle
                 self._resize_origin = QRect(self._selection)
                 return
+            annot_hit = self._hit_annot_handle(event.pos())
+            if annot_hit is not None:
+                self._active_annot, self._annot_resize_handle = annot_hit
+                self._annot_resize_origin = QRect(self._annots[self._active_annot].rect)
+                return
+            picked = self._hit_annot(event.pos())
+            if picked is not None:
+                self._active_annot = picked
+                self.update()
+                return
             if (
                 self._tool
                 and self._selection
@@ -194,6 +207,7 @@ class CaptureOverlay(QWidget):
             ):
                 self._draw_start = event.pos()
                 self._draft = None
+                self._active_annot = -1
             return
         self._press = event.pos()
         self._dragging = False
@@ -206,6 +220,19 @@ class CaptureOverlay(QWidget):
             self._selection = self._resize_rect(self._resize_handle, pos, self._resize_origin)
             self._place_toolbar()
             self._update_magnifier(pos, (self._selection.width(), self._selection.height()))
+            self.update()
+            return
+        if (
+            self._finalized
+            and self._annot_resize_handle
+            and self._annot_resize_origin is not None
+            and 0 <= self._active_annot < len(self._annots)
+        ):
+            rect = self._resize_rect(self._annot_resize_handle, pos, self._annot_resize_origin)
+            if self._selection:
+                rect = rect.intersected(self._selection)
+            self._annots[self._active_annot].rect = rect
+            self._update_magnifier(pos, (rect.width(), rect.height()))
             self.update()
             return
         if self._finalized and self._draw_start is not None and self._selection:
@@ -244,6 +271,12 @@ class CaptureOverlay(QWidget):
                 self._update_magnifier(event.pos(), None)
                 self.update()
                 return
+            if self._annot_resize_handle:
+                self._annot_resize_handle = None
+                self._annot_resize_origin = None
+                self._update_magnifier(event.pos(), None)
+                self.update()
+                return
             if self._draw_start is not None and self._draft and self._draft.width() > 2 and self._draft.height() > 2:
                 self._annots.append(
                     Annotation(
@@ -253,6 +286,7 @@ class CaptureOverlay(QWidget):
                         self._pen_width,
                     )
                 )
+                self._active_annot = len(self._annots) - 1
             self._draw_start = None
             self._draft = None
             self._update_magnifier(event.pos(), None)
@@ -355,15 +389,12 @@ class CaptureOverlay(QWidget):
             "w": QPoint(rect.left(), cy),
         }
 
-    def _hit_handle(self, pos: QPoint) -> str | None:
-        if not self._selection:
-            return None
-        points = self._handle_points(self._selection)
+    def _hit_handle_on(self, rect: QRect, pos: QPoint) -> str | None:
+        points = self._handle_points(rect)
         for name in ("nw", "ne", "se", "sw", "n", "s", "e", "w"):
             pt = points[name]
             if abs(pos.x() - pt.x()) <= HANDLE_HIT and abs(pos.y() - pt.y()) <= HANDLE_HIT:
                 return name
-        rect = self._selection
         x, y = pos.x(), pos.y()
         inside_x = rect.left() - HANDLE_HIT <= x <= rect.right() + HANDLE_HIT
         inside_y = rect.top() - HANDLE_HIT <= y <= rect.bottom() + HANDLE_HIT
@@ -375,6 +406,28 @@ class CaptureOverlay(QWidget):
             return "w"
         if inside_y and abs(x - rect.right()) <= HANDLE_HIT:
             return "e"
+        return None
+
+    def _hit_handle(self, pos: QPoint) -> str | None:
+        if not self._selection:
+            return None
+        return self._hit_handle_on(self._selection, pos)
+
+    def _hit_annot_handle(self, pos: QPoint) -> tuple[int, str] | None:
+        if 0 <= self._active_annot < len(self._annots):
+            handle = self._hit_handle_on(self._annots[self._active_annot].rect, pos)
+            if handle:
+                return self._active_annot, handle
+        for index in range(len(self._annots) - 1, -1, -1):
+            handle = self._hit_handle_on(self._annots[index].rect, pos)
+            if handle:
+                return index, handle
+        return None
+
+    def _hit_annot(self, pos: QPoint) -> int | None:
+        for index in range(len(self._annots) - 1, -1, -1):
+            if self._annots[index].rect.adjusted(-4, -4, 4, 4).contains(pos):
+                return index
         return None
 
     def _resize_rect(self, handle: str, pos: QPoint, origin: QRect) -> QRect:
@@ -394,7 +447,12 @@ class CaptureOverlay(QWidget):
         handle = self._hit_handle(pos)
         if handle:
             self.setCursor(HANDLE_CURSOR[handle])
-        elif self._tool:
+            return
+        annot_hit = self._hit_annot_handle(pos)
+        if annot_hit is not None:
+            self.setCursor(HANDLE_CURSOR[annot_hit[1]])
+            return
+        if self._tool:
             self.setCursor(Qt.CrossCursor)
         else:
             self.setCursor(Qt.ArrowCursor)
@@ -422,13 +480,21 @@ class CaptureOverlay(QWidget):
 
     def _on_color_changed(self, color: QColor) -> None:
         self._pen_color = QColor(color)
+        if 0 <= self._active_annot < len(self._annots):
+            self._annots[self._active_annot].color = QColor(color)
+            self.update()
 
     def _on_width_changed(self, width: int) -> None:
         self._pen_width = int(width)
+        if 0 <= self._active_annot < len(self._annots):
+            self._annots[self._active_annot].width = int(width)
+            self.update()
 
     def _undo_annot(self) -> None:
         if self._annots:
             self._annots.pop()
+            if self._active_annot >= len(self._annots):
+                self._active_annot = len(self._annots) - 1
             self.update()
 
     def _draw_annotations(
@@ -578,6 +644,8 @@ class CaptureOverlay(QWidget):
             painter.drawRect(active.adjusted(0, 0, -1, -1))
             if self._finalized:
                 self._draw_handles(painter, active)
+                if 0 <= self._active_annot < len(self._annots):
+                    self._draw_handles(painter, self._annots[self._active_annot].rect)
 
         if not self._finalized:
             pos = self.mapFromGlobal(QCursor.pos())
