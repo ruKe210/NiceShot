@@ -41,7 +41,12 @@ def enable_dpi_aware() -> None:
 
 
 def icon_file() -> Path:
-    return Path(__file__).resolve().parent / "assets" / "icon.png"
+    assets = Path(__file__).resolve().parent / "assets"
+    for name in ("icon.ico", "icon.png"):
+        path = assets / name
+        if path.is_file():
+            return path
+    return assets / "icon.png"
 
 
 def _drawn_icon() -> QIcon:

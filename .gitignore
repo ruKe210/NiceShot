@@ -4,4 +4,4 @@ __pycache__/
 .idea/
 .vscode/
 *.png
-!app/assets/*
+!app/assets/**
