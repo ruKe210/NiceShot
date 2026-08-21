@@ -66,47 +66,110 @@ def _verified_y(search: np.ndarray, template: np.ndarray) -> int | None:
     return None
 
 
-def stitch_vertical(canvas: np.ndarray, frame: np.ndarray) -> np.ndarray:
-    """把新帧拼到长图底部，按重叠区域对齐。"""
-    if canvas.shape[0] >= frame.shape[0] and frames_same(canvas[-frame.shape[0] :], frame):
-        return canvas
-    if canvas.shape[1] != frame.shape[1]:
-        frame = cv2.resize(frame, (canvas.shape[1], frame.shape[0]), interpolation=cv2.INTER_AREA)
-
-    h1, w1 = canvas.shape[:2]
-    h2, w2 = frame.shape[:2]
-    if h1 < MIN_BAND or h2 < MIN_BAND:
-        return np.vstack([canvas, frame])
-
-    right = max(SIDE_MARGIN + 8, w1 - SIDE_MARGIN)
+def _content_x(width: int) -> tuple[int, int]:
+    right = max(SIDE_MARGIN + 8, width - SIDE_MARGIN)
     left = min(SIDE_MARGIN, right - 8)
-    search = frame[:, left:right]
+    return left, right
 
-    for band in (120, 72, 40, MIN_BAND):
-        band = min(band, h1 // 2, h2 // 2)
+
+def detect_scroll(prev: np.ndarray, curr: np.ndarray) -> tuple[str, np.ndarray | None]:
+    """比较相邻两帧，判断上滚/下滚，并切出需要补上的新区域。"""
+    if prev.shape[1] != curr.shape[1]:
+        curr = cv2.resize(curr, (prev.shape[1], curr.shape[0]), interpolation=cv2.INTER_AREA)
+    if frames_same(prev, curr):
+        return "none", None
+
+    h1, w1 = prev.shape[:2]
+    h2 = curr.shape[0]
+    left, right = _content_x(w1)
+    prev_c = prev[:, left:right]
+    curr_c = curr[:, left:right]
+    downs: list[tuple[np.ndarray, int, int]] = []
+    ups: list[tuple[np.ndarray, int, int]] = []
+
+    for band in (120, 80, 48, MIN_BAND):
+        band = min(band, h1 // 3, h2 // 3)
         if band < MIN_BAND:
             continue
-        template = canvas[h1 - band : h1, left:right]
-        y = _verified_y(search, template)
-        if y is None:
-            continue
-        new_start = y + band
-        if new_start >= h2:
-            return canvas
-        return np.vstack([canvas, frame[new_start:]])
+        y_down = _verified_y(curr_c, prev_c[-band:])
+        if y_down is not None:
+            start = y_down + band
+            extra = curr[start:] if start < h2 else None
+            if extra is not None and extra.shape[0] > 0:
+                downs.append((extra, y_down, band))
+        y_up = _verified_y(curr_c, prev_c[:band])
+        if y_up is not None and y_up > 0:
+            extra = curr[:y_up]
+            if extra.shape[0] > 0:
+                ups.append((extra, y_up, band))
 
-    top_band = min(80, h2 // 3, h1 // 3)
-    if top_band >= MIN_BAND:
-        y = _verified_y(canvas[max(0, h1 - h2) : h1, left:right], frame[0:top_band, left:right])
+    best_down = max(downs, key=lambda item: item[0].shape[0], default=None)
+    best_up = max(ups, key=lambda item: item[0].shape[0], default=None)
+
+    if best_down and best_up:
+        down_len, up_len = best_down[0].shape[0], best_up[0].shape[0]
+        if up_len > down_len * 1.15:
+            return "up", best_up[0]
+        if down_len > up_len * 1.15:
+            return "down", best_down[0]
+        if best_down[1] <= best_up[1]:
+            return "down", best_down[0]
+        return "up", best_up[0]
+    if best_down:
+        return "down", best_down[0]
+    if best_up:
+        return "up", best_up[0]
+
+    mid = h1 // 2
+    band = min(60, h1 // 4, h2 // 4)
+    if band >= MIN_BAND:
+        y = _verified_y(curr_c, prev_c[mid : mid + band])
         if y is not None:
-            overlap = (min(h1, h2) - y)
-            new_start = max(0, overlap)
-            if new_start < h2:
-                return np.vstack([canvas, frame[new_start:]])
+            shift = y - mid
+            if shift > 2:
+                extra = curr[:shift]
+                if extra.shape[0] > 0:
+                    return "up", extra
+            if shift < -2:
+                extra = curr[y + band :]
+                if extra.shape[0] > 0:
+                    return "down", extra
+    return "none", None
 
-    if frames_same(canvas[-min(h1, h2) :], frame[-min(h1, h2) :]):
-        return canvas
-    return np.vstack([canvas, frame[h2 // 5 :]])
+
+def _already_filled(canvas: np.ndarray, extra: np.ndarray, side: str) -> bool:
+    take = min(canvas.shape[0], extra.shape[0])
+    if take < 1:
+        return True
+    if side == "down":
+        return frames_same(canvas[-take:], extra[-take:])
+    return frames_same(canvas[:take], extra[:take])
+
+
+def stitch_vertical(
+    canvas: np.ndarray,
+    frame: np.ndarray,
+    prev_frame: np.ndarray | None = None,
+) -> tuple[np.ndarray, str]:
+    """按滚动方向把新区域接到长图上：下滚接下，上滚接上。"""
+    if canvas.shape[1] != frame.shape[1]:
+        frame = cv2.resize(frame, (canvas.shape[1], frame.shape[0]), interpolation=cv2.INTER_AREA)
+    prev = prev_frame if prev_frame is not None else (
+        canvas[-frame.shape[0] :] if canvas.shape[0] >= frame.shape[0] else canvas
+    )
+    if prev.shape[1] != frame.shape[1]:
+        prev = cv2.resize(prev, (frame.shape[1], prev.shape[0]), interpolation=cv2.INTER_AREA)
+
+    direction, extra = detect_scroll(prev, frame)
+    if direction == "none" or extra is None or extra.shape[0] == 0:
+        return canvas, "none"
+    if extra.shape[1] != canvas.shape[1]:
+        extra = cv2.resize(extra, (canvas.shape[1], extra.shape[0]), interpolation=cv2.INTER_AREA)
+    if _already_filled(canvas, extra, direction):
+        return canvas, "none"
+    if direction == "up":
+        return np.vstack([extra, canvas]), "up"
+    return np.vstack([canvas, extra]), "down"
 
 
 def focus_window_at(point: QPoint) -> None:
@@ -253,7 +316,7 @@ class ScrollCapturePanel(QWidget):
         first = grab_region(self._region)
         self._last = _to_bgr(first)
         self._canvas = self._last.copy()
-        self._update_hint()
+        self._update_hint("none")
         self._refresh_preview()
         self._timer.start()
 
@@ -311,23 +374,23 @@ class ScrollCapturePanel(QWidget):
                 if self._same_count >= 3:
                     self._auto = False
                     self.auto_btn.setText("自动滚动")
-                    self.hint.setText("似乎已滚到底，可点「完成」")
+                    self.hint.setText("似乎已到边界，可点「完成」")
                 else:
                     wheel_at(self._center())
             return
 
         self._same_count = 0
+        merged, direction = stitch_vertical(self._canvas, frame, self._last)
         self._last = frame
-        merged = stitch_vertical(self._canvas, frame)
         if merged.shape[0] > MAX_HEIGHT:
-            self._canvas = merged[:MAX_HEIGHT]
+            self._canvas = merged[:MAX_HEIGHT] if direction != "down" else merged[-MAX_HEIGHT:]
             self._timer.stop()
             self._auto = False
             self.hint.setText(f"已达最大高度 {MAX_HEIGHT}px，请点完成")
             self._refresh_preview()
             return
         self._canvas = merged
-        self._update_hint()
+        self._update_hint(direction)
         self._refresh_preview()
         if self._auto:
             wheel_at(self._center())
@@ -343,12 +406,13 @@ class ScrollCapturePanel(QWidget):
             return
         self._preview.set_canvas(self._canvas, self._preview_screen())
 
-    def _update_hint(self) -> None:
+    def _update_hint(self, direction: str = "none") -> None:
         if self._canvas is None:
             return
         h = self._canvas.shape[0]
         screens = max(1, round(h / max(1, self._region.height())))
-        self.hint.setText(f"已拼接约 {screens} 屏 · {h} px，继续滚动或点完成")
+        way = {"up": "向上补图", "down": "向下补图"}.get(direction, "继续上下滚动")
+        self.hint.setText(f"已拼接约 {screens} 屏 · {h} px，{way}")
 
     def _finish(self) -> None:
         if self._canvas is None:
