@@ -30,11 +30,18 @@ def pythonw_path() -> str:
 
 
 def project_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parents[1]
 
 
 def script_path() -> Path:
     return project_root() / "main.py"
+
+
+def _asset_icon() -> Path | None:
+    assets = Path(__file__).resolve().parent / "assets"
+    return next((p for p in (assets / "icon.ico", assets / "icon.png") if p.is_file()), None)
 
 
 def is_enabled() -> bool:
@@ -53,13 +60,17 @@ def set_enabled(enabled: bool) -> None:
 
     shell = win32com.client.Dispatch("WScript.Shell")
     shortcut = shell.CreateShortCut(str(path))
-    shortcut.Targetpath = pythonw_path()
-    shortcut.Arguments = f'"{script_path()}"'
+    if getattr(sys, "frozen", False):
+        shortcut.Targetpath = str(Path(sys.executable).resolve())
+        shortcut.Arguments = ""
+        shortcut.IconLocation = str(Path(sys.executable).resolve())
+    else:
+        shortcut.Targetpath = pythonw_path()
+        shortcut.Arguments = f'"{script_path()}"'
+        icon = _asset_icon()
+        if icon is not None:
+            shortcut.IconLocation = str(icon)
     shortcut.WorkingDirectory = str(project_root())
     shortcut.Description = "NiceShot 截图工具"
-    assets = Path(__file__).resolve().parent / "assets"
-    icon = next((p for p in (assets / "icon.ico", assets / "icon.png") if p.is_file()), None)
-    if icon is not None:
-        shortcut.IconLocation = str(icon)
     shortcut.WindowStyle = 7
     shortcut.save()

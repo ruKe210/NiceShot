@@ -5,3 +5,6 @@ __pycache__/
 .vscode/
 *.png
 !app/assets/**
+build/
+dist/
+.venv-pack/
