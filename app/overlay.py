@@ -686,8 +686,8 @@ class CaptureOverlay(QWidget):
         self.toolbar.hide()
         self.magnifier.hide()
         exclude_from_capture(self)
-        hole = QRect(self._selection).adjusted(2, 2, -2, -2)
-        if hole.isValid() and hole.width() > 4 and hole.height() > 4:
+        hole = QRect(self._selection)
+        if hole.isValid() and hole.width() > 2 and hole.height() > 2:
             mask = QRegion(self.rect()).subtracted(QRegion(hole))
             self.setMask(mask)
         self._scroll = ScrollCapturePanel(region)
@@ -789,7 +789,8 @@ class CaptureOverlay(QWidget):
                 painter.restore()
             painter.setPen(QPen(ACCENT, 2))
             painter.setBrush(Qt.NoBrush)
-            painter.drawRect(active.adjusted(0, 0, -1, -1))
+            frame = active.adjusted(-2, -2, 1, 1) if self._scrolling else active.adjusted(0, 0, -1, -1)
+            painter.drawRect(frame)
             if self._finalized and not self._scrolling:
                 self._draw_handles(painter, active)
                 if 0 <= self._active_annot < len(self._annots):
